@@ -42,3 +42,5 @@ internal_docs/
 lib/*
 
 .tmp.deploy*
+
+.DS_Store
