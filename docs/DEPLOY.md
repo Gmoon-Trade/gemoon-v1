@@ -188,6 +188,48 @@ forge verify-contract $PROXY lib/openzeppelin-contracts/contracts/proxy/transpar
 Calldata `initialize` для прокси можно взять из `broadcast/.../run-latest.json`, поле
 `arguments` у транзакции создания.
 
+Проверено на проде 2026-11-03 (коммит `d80068e`, 15 контрактов, включая прокси, ProxyAdmin'ы и
+библиотеки `PriceMath`/`Ticks`): все верифицированы на Robinhood Blockscout и в Sourcify (exact_match),
+близнецы кода — на Sepolia (`TWIN4_*` в `env/sepolia.mk`). Что при этом пригодилось:
+
+- **Аргументы конструктора с цепи.** `cast tx <creation tx> --json | jq -r .input` минус
+  `bytecode.object` артефакта из `out/` = ABI-кодированные аргументы; для CREATE2 через
+  `0x4e59b44847b379578588920cA78FbF26c0B4956C` (хук, Lens) первые 32 байта `input` — соль.
+  Транзакции создания и имена контрактов — в `broadcast/*/4663/run-latest.json`.
+- **Sourcify для любого контракта** (API v2, без ключа): standard JSON из
+  `forge verify-contract --show-standard-json-input <addr> <path:Name>`, `POST
+  https://sourcify.dev/server/v2/verify/<chainId>/<addr>` с `{stdJsonInput, compilerVersion:
+  "0.8.26+commit.8a97fa7a", contractIdentifier, creationTransactionHash}`, затем опрос
+  `GET /v2/verify/<verificationId>`. Для `GemoonController` **убрать `settings.libraries`** из JSON
+  (`jq 'del(.settings.libraries)'`): с ними metadata-hash другой и Sourcify даёт только `match`,
+  без них плейсхолдеры библиотек подставляются сами — `exact_match`. ProxyAdmin'ы (вложенный CREATE)
+  верифицируются с хэшем транзакции создания своего прокси. Sourcify режет серии запросов
+  (429 «Too many requests», пауза 60 с): между отправками делать паузы.
+- **Blockscout.** `forge verify-contract … --verifier blockscout --verifier-url
+  "https://api.blockscout.com/v2/api?chain_id=4663&apikey=$BLOCKSCOUT_API_KEY"` (как в `verify.mk`),
+  для контроллера с `--libraries src/contracts/utils/Price.sol:PriceMath:<addr> --libraries
+  src/contracts/utils/Ticks.sol:Ticks:<addr>` (адреса — `libraries` в `run-latest.json`). Статус без
+  браузера: тот же PRO API, `module=contract&action=getsourcecode&address=<addr>` (сайт
+  `robinhoodchain.blockscout.com` отдаёт curl'у только Cloudflare-челлендж). Верифицированное в
+  Blockscout попадает и в Sourcify, и наоборот.
+- **Etherscan (robin.etherscan.io).** Etherscan API v2, `chainid=4663`, ключ `ETHERSCAN_API_KEY`
+  (нужен платный план). `forge verify-contract` 1.2.2 сюда не отправляет: с `--verifier etherscan`
+  пишет «ETHERSCAN_API_KEY must be set», с `--verifier custom` теряет `chainid`. Поэтому отправлять
+  напрямую: `POST https://api.etherscan.io/v2/api?chainid=4663` с `module=contract`,
+  `action=verifysourcecode`, `codeformat=solidity-standard-json-input`, `sourceCode=<standard JSON>`,
+  `contractname=<path:Name>`, `compilerversion=v0.8.26+commit.8a97fa7a`,
+  `constructorArguements=<args без 0x>` (аргументы получаются так же, как выше), затем опрос
+  `action=checkverifystatus&guid=<result>`. Прокси, ProxyAdmin'ы и уже известный Etherscan байткод
+  он засчитывает как similar match и отвечает «Already Verified». Проверено на проде 2026-11-04
+  (коммит `d80068e`).
+- **Близнецы на Sepolia** (`env/sepolia.mk`): прод-транзакции создания повторяются байт в байт
+  ключом из `env/sepolia.mk`: `cast send --rpc-url $RPC --private-key $PK --json --create <input>`
+  для CREATE, `cast send <Create2Deployer> <input>` для CREATE2 (тот же адрес, что в проде;
+  библиотеки на Sepolia уже лежат по прод-адресам). Прокси не дублируются: конструктор зовёт
+  `initialize` имплементации, а стандартный OZ-код Blockscout и так узнаёт по байткоду. Дальше
+  Sourcify на 11155111 — Blockscout Sepolia подтягивает из него сам (`forge verify-contract`
+  отвечает «already verified»).
+
 7. Первый `deployToken` сделать самим и проверить, что событие `PositionCreated` пришло с
    ненулевой ликвидностью. Помнить, что комиссия первого свопа в свежем деплое остаётся
    начисленной в хуке до следующего свопа, это нормально.
@@ -239,7 +281,8 @@ make deploy-swap-adapter
 
 | Что | Кому | Как вступает в силу |
 |---|---|---|
-| 4 ProxyAdmin (апгрейды), контроллер (в том числе выбор TokenDeployer, то есть кода токенов новых мемов) | `TimelockController` | сразу |
+| ProxyAdmin контроллера, волта и рефералов (апгрейды) | `TimelockController` | сразу |
+| Контроллер (в том числе выбор TokenDeployer, то есть кода токенов новых мемов) | Safe | сразу (`OwnableUpgradeable`, одношаговая передача) |
 | Vault (в том числе доля протокола и её получатель), GmoonReferrals, UniswapV3SwapAdapter | Safe | после `acceptOwnership()` из Safe |
 
 Таймлок новый: задержка `TIMELOCK_MIN_DELAY` (по умолчанию 172800 = 48 ч), proposer, executor и
@@ -254,6 +297,15 @@ make transfer-to-governance ENVIRONMENT=prod
 Порядок: всё, что нужно сделать от деплоера (апгрейды, настройка активов), — до передачи. После
 неё каждый апгрейд идёт через таймлок с задержкой: Safe ставит `ProxyAdmin.upgradeAndCall` в
 `schedule`, через 48 ч — `execute`.
+
+**Состояние прода (chain 4663), передача выполнена и принята 2026-11-15:**
+
+| Что | Владелец |
+|---|---|
+| ProxyAdmin контроллера `0x8b2E6b870aA99C5B9D11f10DEd00cC92941150b8`, волта `0x88DBdf34F00466a231d9382D640B28abe08fb94F`, рефералов `0x2224637cB4554218150A3c5b1D20487BD356FeC7` | TimelockController `0x475e61845633919fad42658e490C3567e04127d3` (48 ч, управляет только Safe, админа нет) |
+| GemoonController, Vault, GmoonReferrals, UniswapV3SwapAdapter | Safe `0x3B1460494A387B1E71c21f44f4e769d786183A09` (принято `acceptOwnership()`) |
+
+Адреса Safe и таймлока записаны в `env/prod.mk` (`GOVERNANCE_SAFE`, `TIMELOCK_ADDRESS`).
 
 ## 4. Апгрейды
 
@@ -299,8 +351,8 @@ make deploy-token-deployer ENVIRONMENT=dev     # скрипт DeployTokenDeploye
 
 `DeployTokenDeployer` читает `CONTROLLER_PROXY_ADDRESS`, деплоит `TokenDeployer(controller)` с кодом
 токена текущего коммита и, если broadcaster владеет контроллером, зовёт `setTokenDeployer` и проверяет
-связку. Иначе (контроллер у таймлока после `TransferToGovernance`) только деплоит и печатает
-calldata `setTokenDeployer(address)`: Safe ставит её в `schedule` таймлока. Напечатанный
+связку. Иначе (контроллер у Safe после `TransferToGovernance`) только деплоит и печатает
+calldata `setTokenDeployer(address)`: Safe вызывает её напрямую, без таймлока. Напечатанный
 `TOKEN DEPLOYER` вписать в `TOKEN_DEPLOYER_ADDRESS`, затем `make verify-wiring` и
 `make -f verify.mk verify-token-deployer`. Мемы, созданные до переключения, остаются со своим кодом.
 

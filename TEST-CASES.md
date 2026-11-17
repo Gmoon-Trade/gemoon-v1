@@ -856,14 +856,15 @@ ERC-1046 `tokenURI` токена: свой URI админа (`setTokenURI`), е�
 
 ## test/TransferToGovernanceTest.sol
 
-Передача владения: ProxyAdmin и контроллер под `TimelockController`, которым управляет Safe; волт (и рефералы, адаптер) — Safe. Деплой настоящий (`DeployGemoon.deployAll`), владелец всего — скрипт, как деплоер в сети.
+Передача владения: ProxyAdmin (апгрейды) под `TimelockController`, которым управляет Safe; контроллер, волт (и рефералы, адаптер) — Safe. Деплой настоящий (`DeployGemoon.deployAll`), владелец всего — скрипт, как деплоер в сети.
 
 | Тест | Что проверяет | Инварианты | Ожидаемый результат |
 |---|---|---|---|
 | `test_DeployTimelock_SafeOnlyRoles_NoAdmin` | Роли нового таймлока | Предлагать, исполнять и отменять может только Safe; админа нет | задержка 48 ч, роли у Safe, `DEFAULT_ADMIN_ROLE` ни у кого |
-| `test_TransferToGovernance_Owners_TimelockAndSafe` | Владельцы после передачи | Апгрейды и торговые настройки — за таймлоком, операционные — у Safe | ProxyAdmin ×3 и контроллер — таймлок, волт — pending Safe; хук без владельца не трогается |
+| `test_TransferToGovernance_Owners_TimelockAndSafe` | Владельцы после передачи | Апгрейды — за таймлоком, owner-роли — у Safe | ProxyAdmin ×2 — таймлок, контроллер — Safe сразу, волт — pending Safe; хук без владельца не трогается |
 | `test_TransferToGovernance_Deployer_CannotUpgrade` | Деплоер после передачи | У деплоера нет права на апгрейд | `upgradeAndCall` от деплоера — `OwnableUnauthorizedAccount` |
-| `test_TransferToGovernance_ControllerSetHook_OnlyAfterDelay` | `controller.setHook` через таймлок | Ничего не исполняется раньше задержки | `execute` до 48 ч откатывается, после — `controller.hook()` обновлён |
+| `test_TransferToGovernance_ControllerSetHook_SafeAtOnce_DeployerReverts` | `controller.setHook` после передачи | Контроллером управляет только Safe, без задержки | деплоер — `OwnableUnauthorizedAccount`, Safe — `controller.hook()` обновлён |
+| `test_TransferToGovernance_ProxyAdminCall_OnlyAfterDelay` | Вызов ProxyAdmin через таймлок | Апгрейды не исполняются раньше задержки | `execute` до 48 ч откатывается, после — вызов выполнен |
 | `test_TransferToGovernance_SafeAcceptsVault` | Safe принимает волт | Ownable2Step завершается новым владельцем | владелец волта — Safe |
 | `testFuzz_Timelock_NotSafe_CannotSchedule` (fuzz) | `schedule` от любого адреса, кроме Safe | Ставить операции в таймлок может только Safe | откат |
 | `test_TransferToGovernance_NotOwner_Reverts` | Отправитель не владелец | Передать может только текущий владелец | откат |

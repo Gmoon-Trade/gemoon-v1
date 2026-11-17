@@ -12,8 +12,8 @@ import {Upgrades} from "@oz-upgrades/Upgrades.sol";
 import {DeployGemoon, TransferToGovernance} from "../script/GemoonDeploy.sol";
 import {DeployMockToken} from "./DeployGemoonTest.sol";
 
-/// @notice `TransferToGovernance`: upgrades and trading settings end up behind a timelock run by
-/// the Safe, operational owners with the Safe, nothing with the deployer.
+/// @notice `TransferToGovernance`: upgrades end up behind a timelock run by the Safe, every owner
+/// role (controller, vault, ...) with the Safe, nothing with the deployer.
 contract TransferToGovernanceTest is Test {
     uint256 constant DELAY = 48 hours;
 
@@ -87,7 +87,7 @@ contract TransferToGovernanceTest is Test {
 
         assertEq(ProxyAdmin(t.controllerProxyAdmin).owner(), address(timelock), "controller admin");
         assertEq(ProxyAdmin(t.vaultProxyAdmin).owner(), address(timelock), "vault admin");
-        assertEq(d.controller.owner(), address(timelock), "controller owner");
+        assertEq(d.controller.owner(), safe, "controller owner");
         assertEq(d.vault.pendingOwner(), safe, "vault pending owner");
     }
 
@@ -107,23 +107,37 @@ contract TransferToGovernanceTest is Test {
         );
     }
 
-    /// @dev Controller settings go through the timelock: a `setHook` scheduled by the Safe can only
-    /// be executed after the delay. The hook itself has no owner, there is nothing to hand over.
-    function test_TransferToGovernance_ControllerSetHook_OnlyAfterDelay() external {
+    /// @dev The Safe owns the controller directly: `setHook` needs no delay, the deployer cannot call it.
+    function test_TransferToGovernance_ControllerSetHook_SafeAtOnce_DeployerReverts() external {
         _transfer();
-        bytes memory call = abi.encodeCall(d.controller.setHook, (address(d.hook)));
+        vm.prank(address(gov));
+        vm.expectRevert(
+            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(gov))
+        );
+        d.controller.setHook(address(d.hook));
 
         vm.prank(safe);
-        timelock.schedule(address(d.controller), 0, call, bytes32(0), bytes32(0), DELAY);
+        d.controller.setHook(address(d.hook));
+        assertEq(d.controller.hook(), address(d.hook));
+    }
+
+    /// @dev An upgrade goes through the timelock: scheduled by the Safe, executable only after the
+    /// delay (checked with the controller ProxyAdmin's `transferOwnership` as a harmless call).
+    function test_TransferToGovernance_ProxyAdminCall_OnlyAfterDelay() external {
+        _transfer();
+        bytes memory call = abi.encodeWithSignature("transferOwnership(address)", safe);
+
+        vm.prank(safe);
+        timelock.schedule(t.controllerProxyAdmin, 0, call, bytes32(0), bytes32(0), DELAY);
 
         vm.prank(safe);
         vm.expectRevert();
-        timelock.execute(address(d.controller), 0, call, bytes32(0), bytes32(0));
+        timelock.execute(t.controllerProxyAdmin, 0, call, bytes32(0), bytes32(0));
 
         vm.warp(block.timestamp + DELAY);
         vm.prank(safe);
-        timelock.execute(address(d.controller), 0, call, bytes32(0), bytes32(0));
-        assertEq(d.controller.hook(), address(d.hook));
+        timelock.execute(t.controllerProxyAdmin, 0, call, bytes32(0), bytes32(0));
+        assertEq(ProxyAdmin(t.controllerProxyAdmin).owner(), safe);
     }
 
     function test_TransferToGovernance_SafeAcceptsVault() external {
@@ -140,7 +154,7 @@ contract TransferToGovernanceTest is Test {
         vm.prank(caller);
         vm.expectRevert();
         timelock.schedule(
-            address(d.controller), 0, abi.encodeCall(d.controller.setHook, (address(d.hook))), 0, 0, DELAY
+            t.controllerProxyAdmin, 0, abi.encodeWithSignature("transferOwnership(address)", safe), 0, 0, DELAY
         );
     }
 

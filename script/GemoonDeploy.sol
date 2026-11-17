@@ -1616,8 +1616,8 @@ contract ProxyReferralsUpgrade is GemoonDeployBase {
 }
 
 /// @notice Moves control of a deployment from the deployer to governance: a TimelockController run
-///         by a Safe for everything that can change trading (upgrades, controller settings), the
-///         Safe itself for the operational owners (vault, referrals, adapter).
+///         by a Safe for upgrades (the ProxyAdmins), the Safe itself for every owner role
+///         (controller, vault, referrals, adapter).
 /// @dev Env:
 ///  - GOVERNANCE_SAFE                Safe: proposer and executor of the timelock, owner of the rest (required)
 ///  - TIMELOCK_ADDRESS               existing TimelockController to reuse (optional: deploys one)
@@ -1625,9 +1625,9 @@ contract ProxyReferralsUpgrade is GemoonDeployBase {
 ///  - CONTROLLER/VAULT_PROXY_ADDRESS and their *_PROXY_ADMIN_ADDRESS (required)
 ///  - REFERRALS_PROXY_ADDRESS, REFERRALS_PROXY_ADMIN_ADDRESS, SWAP_ADAPTER (optional: skipped if empty)
 /// The broadcaster must own every contract and ProxyAdmin it touches. To the timelock: every
-/// ProxyAdmin and the controller (one-step, effective at once). The hook has no owner, nothing to hand
-/// over.
-/// To the Safe: vault, referrals and adapter (Ownable2Step: the Safe calls `acceptOwnership`).
+/// ProxyAdmin (one-step, effective at once). The hook has no owner, nothing to hand over.
+/// To the Safe: the controller (one-step, effective at once), vault, referrals and adapter
+/// (Ownable2Step: the Safe calls `acceptOwnership`).
 /// The new timelock has no admin: its roles can only change through its own delayed operations.
 contract TransferToGovernance is GemoonDeployBase {
     uint256 public constant DEFAULT_TIMELOCK_DELAY = 48 hours;
@@ -1702,7 +1702,7 @@ contract TransferToGovernance is GemoonDeployBase {
             _transferProxyAdmin(sender, t.referrals, t.referralsProxyAdmin, timelock);
         }
 
-        _transferOwnable(sender, "CONTROLLER", t.controller, timelock);
+        _transferOwnable(sender, "CONTROLLER", t.controller, safe);
         _transferOwnable(sender, "VAULT", t.vault, safe);
         if (t.referrals != address(0)) _transferOwnable(sender, "REFERRALS", t.referrals, safe);
         if (t.adapter != address(0)) _transferOwnable(sender, "SWAP ADAPTER", t.adapter, safe);
