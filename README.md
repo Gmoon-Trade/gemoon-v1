@@ -1,427 +1,429 @@
- `upgrade-controller-proxy` требует `GEMOON_OWNER` явно: `reinitialize` заново назначает владельца контроллера.# Gemoon
+# Gemoon
 
-Протокол запуска мем-токенов на Uniswap V4. Один вызов контроллера создаёт токен, пул Meme/USDG
-с хуком и одностороннюю позицию со всей эмиссией. Хук берёт комиссию с каждого свопа в USDG,
-волт делит её между создателем и стейкерами мема и конвертирует в наградные активы.
+A meme-token launch protocol on Uniswap V4. A single controller call creates the token, a Meme/USDG
+pool with a hook, and a single-sided position holding the entire supply. The hook takes a USDG fee on
+every swap; the vault splits it between the meme's creator and stakers and converts it into reward assets.
 
-## Контракты
+## Contracts
 
-| Контракт | Файл | Роль |
+| Contract | File | Role |
 |---|---|---|
-| GemoonController | `src/contracts/Gemoon.sol` | Точка входа: деплой мема — токен (через TokenDeployer), пул и позиция. Прокси, OwnableUpgradeable. |
-| TokenDeployer | `src/contracts/TokenDeployer.sol`, интерфейс `ITokenDeployer.sol` | Создаёт токен нового мема по вызову контроллера и возвращает его адрес, больше ничего: вся эмиссия минтится контроллеру. Вызывать `deployToken` может только контроллер, заданный в конструкторе. Не прокси, без владельца и состояния. Новый код токенов — новый TokenDeployer и `controller.setTokenDeployer`, без апгрейда контроллера; уже созданные мемы остаются со своим кодом. |
-| HookManager | `src/contracts/hooks/HookManager.sol`, интерфейс `IHookManager.sol` | Хук Uniswap V4: комиссия в USDG на каждом свопе (1%..5% по выбору создателя, первые 15 секунд пула от 80% линейно вниз), вся комиссия уходит в волт, делить её — дело волта. Не прокси (не обновляемый), без владельца: волт и контроллер заданы в конструкторе, админ-функций нет. Адрес майнится под биты разрешений. |
-| Vault | `src/contracts/vault/Vault.sol` | Один контракт, логический волт на каждый мем: приём всей комиссии от хука и её разбивка (доля протокола `protocolShareBps` → `protocolRecipient`, остальное создателю и стейкерам), стейкинг, конвертация, выплаты. Прокси, Ownable2Step. |
-| GmoonReferrals | `src/contracts/Referrals.sol`, интерфейс `IReferrals.sol` | Получатель протокольной доли (`Vault.protocolRecipient`): реферальные коды, привязка пользователя к рефереру, `refShareBips` протокольной комиссии мемов рефералов — рефереру, остальное протоколу. Прокси, Ownable2Step, Pausable (только выплаты рефералам). |
-| UniswapV3SwapAdapter | `src/contracts/adapters/UniswapV3SwapAdapter.sol` | Меняет USDG волта на наградные активы в пулах Uniswap V3, минимальный выход считает сам по TWAP пула. Ownable2Step, не прокси: волт меняет адаптер через `setSwapAdapter`. |
-| GemoonToken | `src/contracts/Token.sol` | ERC20 мема с метаданными и админами, ERC-1046 `tokenURI` (base64 JSON, собирается ончейн из данных токена; админ может задать свой URI через `setTokenURI`) и ERC-165, счётчик холдеров `totalHolders`, распределение комиссии `feeInfo` (общая, создателю, в волт, протоколу; фиксируется при деплое и попадает в `tokenURI`). Создаётся TokenDeployer'ом, вся эмиссия — получателю из конструктора (контроллеру). Не обновляемый. |
-| ProjectToken | `src/contracts/ProjectToken.sol`, скрипт `script/DeployProjectToken.s.sol` | Отдельный токен проекта вне контроллера: копия GemoonToken без `feeInfo` и админов, `tokenURI` — простая ссылка (get/set), менять ссылку, картинку и описание может владелец (Ownable2Step, кошелёк деплоя). Весь supply (1 млрд) минтится деплоеру. Скрипт создаёт пул Uniswap V4 к USDG без хука (комиссия `PROJECT_POOL_FEE`) и кладёт весь supply в одностороннюю позицию, NFT позиции — деплоеру. Не обновляемый. Robinhood: `0xCef233054553A3e27d23f19D3DfBA1A86eC84C62`. |
-| PositionDeployer | `src/contracts/utils/PositionDeployer.sol` | Внутренняя библиотека, инлайнится в контроллер: минт позиции через PositionManager и Permit2. Отдельного адреса нет. |
-| Ticks, PriceMath | `src/contracts/utils/Ticks.sol`, `src/contracts/utils/Price.sol` | Внешние библиотеки, линкуются при деплое. |
-| GemoonLens | `src/contracts/lens/GemoonLens.sol`, интерфейс `IGemoonLens.sol` | Read-only батч-чтения для фронтенда: всё о списке мемов одним `eth_call`. Без состояния, владельца и средств, только `view`. Не прокси: при смене адресов протокола деплоится заново (CREATE2, `make deploy-lens`). |
+| GemoonController | `src/contracts/Gemoon.sol` | Entry point: deploys a meme — token (via TokenDeployer), pool and position. Proxy, OwnableUpgradeable. |
+| TokenDeployer | `src/contracts/TokenDeployer.sol`, interface `ITokenDeployer.sol` | Creates the token of a new meme on a controller call and returns its address, nothing more: the whole supply is minted to the controller. Only the controller set in the constructor may call `deployToken`. Not a proxy, no owner, no state. New token code means a new TokenDeployer plus `controller.setTokenDeployer`, with no controller upgrade; memes already created keep their own code. |
+| HookManager | `src/contracts/hooks/HookManager.sol`, interface `IHookManager.sol` | Uniswap V4 hook: a USDG fee on every swap (1%..5% chosen by the creator; during the pool's first 15 seconds it starts at 80% and decays linearly), the whole fee goes to the vault, which decides how to split it. Not a proxy (not upgradeable), no owner: vault and controller are set in the constructor, there are no admin functions. The address is mined to match the permission bits. |
+| Vault | `src/contracts/vault/Vault.sol` | One contract, one logical vault per meme: receives the whole fee from the hook and splits it (protocol share `protocolShareBps` → `protocolRecipient`, the rest to the creator and stakers), staking, conversion, payouts. Proxy, Ownable2Step. |
+| GmoonReferrals | `src/contracts/Referrals.sol`, interface `IReferrals.sol` | Recipient of the protocol share (`Vault.protocolRecipient`): referral codes, binding a user to a referrer, `refShareBips` of the protocol fee of the referred users' memes goes to the referrer, the rest to the protocol. Proxy, Ownable2Step, Pausable (referral payouts only). |
+| UniswapV3SwapAdapter | `src/contracts/adapters/UniswapV3SwapAdapter.sol` | Swaps the vault's USDG for reward assets in Uniswap V3 pools; computes the minimum output itself from the pool TWAP. Ownable2Step, not a proxy: the vault switches adapters via `setSwapAdapter`. |
+| GemoonToken | `src/contracts/Token.sol` | Meme ERC20 with metadata and admins, ERC-1046 `tokenURI` (base64 JSON built on-chain from the token data; an admin can set a custom URI via `setTokenURI`) and ERC-165, a holder counter `totalHolders`, and the fee distribution `feeInfo` (total, creator, vault, protocol; fixed at deploy and included in `tokenURI`). Created by TokenDeployer, the whole supply goes to the constructor's recipient (the controller). Not upgradeable. |
+| ProjectToken | `src/contracts/ProjectToken.sol`, script `script/DeployProjectToken.s.sol` | A standalone project token outside the controller: a copy of GemoonToken without `feeInfo` and admins, `tokenURI` is a plain link (get/set); the owner (Ownable2Step, the deployer wallet) can change the link, image and description. The whole supply (1 bn) is minted to the deployer. The script creates a Uniswap V4 pool against USDG without a hook (fee `PROJECT_POOL_FEE`) and puts the whole supply into a single-sided position; the position NFT goes to the deployer. Not upgradeable. Robinhood: `0xCef233054553A3e27d23f19D3DfBA1A86eC84C62`. |
+| PositionDeployer | `src/contracts/utils/PositionDeployer.sol` | Internal library inlined into the controller: mints the position through PositionManager and Permit2. Has no address of its own. |
+| Ticks, PriceMath | `src/contracts/utils/Ticks.sol`, `src/contracts/utils/Price.sol` | External libraries, linked at deploy time. |
+| GemoonLens | `src/contracts/lens/GemoonLens.sol`, interface `IGemoonLens.sol` | Read-only batch reads for the frontend: everything about a list of memes in one `eth_call`. No state, owner or funds, `view` only. Not a proxy: when protocol addresses change it is redeployed (CREATE2, `make deploy-lens`). |
 
-Все ключевые контракты стоят за `TransparentUpgradeableProxy`, у каждого свой `ProxyAdmin`.
-Исключение GemoonLens: он ничего не хранит, и обновлять его нечего, новая версия — это новый деплой.
-TokenDeployer тоже без прокси: его не обновляют, а заменяют (`setTokenDeployer`), чтобы код токенов
-новых мемов менялся без апгрейда контроллера.
-Pair-токен один на весь протокол: контроллер, хук и волт рассчитаны на одну и ту же USDG.
+All key contracts sit behind a `TransparentUpgradeableProxy`, each with its own `ProxyAdmin`.
+GemoonLens is the exception: it stores nothing, so there is nothing to upgrade; a new version is a new deployment.
+TokenDeployer also has no proxy: it is not upgraded but replaced (`setTokenDeployer`), so the token code
+of new memes can change without upgrading the controller.
+There is a single pair token for the whole protocol: the controller, hook and vault are built around the same USDG.
 
-## Флоу взаимодействия
+## Interaction flow
 
-### Развёртывание, один раз
+### Deployment, once
 
-`DeployGemoon` поднимает всё в одном прогоне в порядке Vault, GemoonController, TokenDeployer,
-GmoonReferrals, HookManager, UniswapV3SwapAdapter. Хук получает адреса волта, контроллера и рефералов (получатель
-протокольной доли) в `initialize`. Контроллер — единственный, кто может звать
-`onlyController`-функции хука (`notifyPoolCreated`). Адреса волта и контроллера хук получает в
-конструкторе и больше не меняет: владельца у хука нет.
-Контроллер получает хук, волт, TokenDeployer и PositionManager сеттерами,
-волт получает хук, контроллер и адаптер. Активы из `DEPLOY_ASSETS_FILE` (robinhood-активы)
-разрешаются в волте и получают маршрут на адаптере в том же прогоне, если их пул USDG/актив
-есть в фабрике и отдаёт TWAP; остальные пропускаются с причиной в отчёте. В конце владение уходит
-на `GEMOON_OWNER`; волту, рефералам и адаптеру нужен отдельный `acceptOwnership`.
+`DeployGemoon` brings everything up in a single run in the order Vault, GemoonController, TokenDeployer,
+GmoonReferrals, HookManager, UniswapV3SwapAdapter. The hook receives the vault, controller and referrals
+addresses (the protocol-share recipient) in `initialize`. The controller is the only one that may call the
+hook's `onlyController` functions (`notifyPoolCreated`). The hook gets the vault and controller addresses in
+its constructor and never changes them: the hook has no owner.
+The controller receives the hook, vault, TokenDeployer and PositionManager through setters,
+the vault receives the hook, controller and adapter. Assets from `DEPLOY_ASSETS_FILE` (robinhood assets)
+are allowed in the vault and get a route on the adapter in the same run if their USDG/asset pool
+exists in the factory and provides a TWAP; the rest are skipped with the reason in the report. At the end ownership
+moves to `GEMOON_OWNER`; the vault, referrals and adapter need a separate `acceptOwnership`.
 
-Полуразвёрнутое состояние безопасно: контроллер не деплоит токены без хука, волта, TokenDeployer и
-PositionManager, хук не пускает пулы незарегистрированных мемов, волт принимает комиссии только от
-своего хука.
+A half-deployed state is safe: the controller does not deploy tokens without the hook, vault, TokenDeployer and
+PositionManager, the hook rejects pools of unregistered memes, the vault accepts fees only from
+its own hook.
 
-### Жизненный цикл мема
+### Meme lifecycle
 
-1. **Создание.** Создатель зовёт `GemoonController.deployToken(config)` с конфигом токена,
-   адресами наград и набором наградных активов с весами. Контроллер добавляет себя и вызывающего
-   в админы токена и создаёт токен через `tokenDeployer`: TokenDeployer деплоит токен, вся эмиссия
-   минтится контроллеру, `creator()` токена — вызывающий `deployToken`. Контроллер проверяет, что
-   получил ровно всю эмиссию (`INITIAL_SUPPLY_X18`), иначе `TokenSupplyMismatch`. Дальше он
-   регистрирует мем в волте, инициализирует пул Meme/USDG с
-   хуком и нулевым LP fee и минтит всю эмиссию в одностороннюю позицию выше стартовой цены.
-   NFT позиции остаётся у контроллера. События: `TokenCreated`, `PoolCreated`, `PositionCreated`.
-   Если в `config.devBuy.memeAmount` не ноль, контроллер сразу после создания пула открывает
-   PoolManager через `unlock` и в `unlockCallback` покупает этот объём мема exact output для
-   `msg.sender`: USDG списывается с вызывающего напрямую в PoolManager (нужен approve на
-   контроллер, не больше `maxPairIn`), мем уходит ему же. Всё в той же транзакции, поэтому никто
-   не торгует раньше создателя. Хук берёт с контроллера базовую ставку мема без анти-снайп
-   надбавки. Лимит 80% эмиссии. Событие `DevBuy`.
+1. **Creation.** The creator calls `GemoonController.deployToken(config)` with the token config,
+   reward addresses and a set of reward assets with weights. The controller adds itself and the caller
+   as token admins and creates the token via `tokenDeployer`: TokenDeployer deploys the token, the whole supply
+   is minted to the controller, and the token's `creator()` is the caller of `deployToken`. The controller checks that
+   it received exactly the full supply (`INITIAL_SUPPLY_X18`), otherwise `TokenSupplyMismatch`. Next it
+   registers the meme in the vault, initializes the Meme/USDG pool with
+   the hook and a zero LP fee, and mints the whole supply into a single-sided position above the starting price.
+   The position NFT stays with the controller. Events: `TokenCreated`, `PoolCreated`, `PositionCreated`.
+   If `config.devBuy.memeAmount` is non-zero, right after creating the pool the controller opens
+   the PoolManager via `unlock` and, in `unlockCallback`, buys that amount of the meme (exact output) for
+   `msg.sender`: USDG is pulled from the caller straight into the PoolManager (an approval to the
+   controller is required, not more than `maxPairIn`), and the meme goes to the caller. All in the same transaction, so nobody
+   trades before the creator. The hook charges the controller the meme's base rate without the anti-snipe
+   surcharge. The limit is 80% of the supply. Event `DevBuy`.
 
-2. **Торговля.** Трейдеры ходят через любой роутер Uniswap V4, например Universal Router.
-   На каждом свопе хук берёт комиссию в USDG: в `beforeSwap`, если сумма USDG задана
-   пользователем, иначе в `afterSwap`. Базовую ставку от 1% до 5% выбирает создатель в
-   `rewardsConfig.swapFeeBips`. Первые `DYNAMIC_FEE_THRESHOLD` секунд (30) после создания пула
-   ставка выше: 80% в момент создания и линейно вниз до базовой (`feeBipsAt`). Исключение —
-   свопы самого контроллера, то есть dev buy: для них всегда базовая ставка. Время создания
-   хук записывает сам в `afterInitialize` первого пула мема, созданного контроллером
-   (`poolTimestamps`, событие `PoolTimestampRecorded`); пулы, созданные кем-то другим, и
-   следующие пулы того же мема его не трогают. Ставку хук получает от
-   контроллера через `notifyPoolCreated(meme, feeBips)` — один раз на мем
-   (`PoolAlreadyNotified`) и только в блоке создания пула (`PoolNotCreatedInThisBlock`). Поэтому
-   ни контроллер, ни владелец протокола (у хука владельца нет) не могут включить 80% на уже
-   торгующемся пуле, перезапустить или сдвинуть окно. Хук только считает размер комиссии и
-   ничего не знает о её разбивке. Комиссия копится в хуке как ERC6909-клеймы, отдельно по каждому
-   мему.
+2. **Trading.** Traders go through any Uniswap V4 router, e.g. the Universal Router.
+   On every swap the hook takes a USDG fee: in `beforeSwap` if the USDG amount is specified
+   by the user, otherwise in `afterSwap`. The base rate, from 1% to 5%, is chosen by the creator in
+   `rewardsConfig.swapFeeBips`. For the first `DYNAMIC_FEE_THRESHOLD` seconds (30) after pool creation the
+   rate is higher: 80% at creation, decaying linearly to the base rate (`feeBipsAt`). The exception is
+   the controller's own swaps, i.e. the dev buy: they always pay the base rate. The hook records the creation time
+   itself in `afterInitialize` of the first pool of a meme created by the controller
+   (`poolTimestamps`, event `PoolTimestampRecorded`); pools created by anyone else, and
+   later pools of the same meme, do not touch it. The hook receives the rate from the
+   controller via `notifyPoolCreated(meme, feeBips)` — once per meme
+   (`PoolAlreadyNotified`) and only in the block where the pool is created (`PoolNotCreatedInThisBlock`). Therefore
+   neither the controller nor the protocol owner (the hook has no owner) can enable 80% on an already
+   trading pool, restart or shift the window. The hook only computes the fee amount and
+   knows nothing about how it is split. The fee accumulates in the hook as ERC6909 claims, separately per
+   meme.
 
-3. **Выплата комиссии.** В конце каждого свопа хук пытается выплатить всё накопленное по этому
-   мему целиком волту и сразу зовёт `Vault.notifyFees(meme, amount)`. Разбивку делает волт:
-   `protocolShareBps` (по умолчанию 2500 bps, четверть) от суммы, включая надбавку окна, он сразу
-   переводит на `protocolRecipient`, остальное оставляет мему. При ставке 1% это 0.25% и 0.75% от
-   сделки, при 5% — 1.25% и 3.75%. Округление вниз в пользу волта мема. Если у `protocolRecipient` есть код
-   (контракт рефералов), волт после перевода зовёт `IProtocolFeeReceiver.notifyFee(meme,
-   toProtocol)`; EOA не уведомляется. Контракт-получатель обязан реализовать этот интерфейс,
-   иначе `notifyFees` откатывается, а с ним и вся выплата хука (своп проходит, комиссия остаётся
-   начисленной в хуке). Доля и получатель — настройки владельца волта (`setProtocolShare`,
-   `setProtocolRecipient`), глобальные: новое значение действует с ближайшей выплаты для всех
-   мемов. Пока доля > 0, а получатель не задан, `notifyFees` откатывается
-   `ProtocolRecipientNotSet`, и комиссия ждёт в хуке.
-   Если в PoolManager пока нет USDG, как на свежем деплое, выплата откатывается внутри try/catch,
-   своп проходит, сумма остаётся начисленной. Забрать её потом может кто угодно через
-   `HookManager.distribute(meme)`, или это сделает следующий своп.
+3. **Fee payout.** At the end of each swap the hook tries to pay out everything accumulated for that
+   meme in one go to the vault and immediately calls `Vault.notifyFees(meme, amount)`. The vault does the split:
+   `protocolShareBps` (2500 bps by default, a quarter) of the amount, including the window surcharge, is transferred at once
+   to `protocolRecipient`, the rest stays with the meme. At a 1% rate that is 0.25% and 0.75% of the
+   trade, at 5% — 1.25% and 3.75%. Rounding is down, in favour of the meme's vault. If `protocolRecipient` has code
+   (the referrals contract), the vault calls `IProtocolFeeReceiver.notifyFee(meme,
+   toProtocol)` after the transfer; an EOA is not notified. A recipient contract must implement this interface,
+   otherwise `notifyFees` reverts, and with it the hook's whole payout (the swap goes through, the fee stays
+   accrued in the hook). The share and recipient are vault-owner settings (`setProtocolShare`,
+   `setProtocolRecipient`), global: a new value applies from the next payout for all
+   memes. While the share is > 0 and no recipient is set, `notifyFees` reverts with
+   `ProtocolRecipientNotSet` and the fee waits in the hook.
+   If the PoolManager has no USDG yet, as on a fresh deploy, the payout reverts inside try/catch,
+   the swap goes through and the amount stays accrued. Anyone can collect it later via
+   `HookManager.distribute(meme)`, or the next swap will do it.
 
-4. **Учёт в волте.** Оставшуюся после протокола часть `notifyFees` делит так: долю
-   `creatorShareBps` создателю (0..50%, `MAX_CREATOR_SHARE_BPS`, больше — `InvalidCreatorShare`;
-   выбирает создатель в `deployToken`, `config.vaultCreatorShareBps`), остальное pro rata текущим
-   стейкерам мема. Если стейкеров нет, всё создателю. Стейкер зарабатывает только на комиссиях,
-   пришедших пока он застейкан. Начисления копятся в USDG внутри открытой эпохи.
+4. **Vault accounting.** `notifyFees` splits the part remaining after the protocol as follows: the share
+   `creatorShareBps` to the creator (0..50%, `MAX_CREATOR_SHARE_BPS`, above that `InvalidCreatorShare`;
+   chosen by the creator in `deployToken`, `config.vaultCreatorShareBps`), the rest pro rata to the meme's current
+   stakers. If there are no stakers, everything goes to the creator. A staker earns only on fees
+   that arrived while they were staked. Accruals accumulate in USDG inside the open epoch.
 
-5. **Конвертация.** Эпоха закрывается по порогу, кипера нет. Как только накопленный в открытой
-   эпохе USDG достигает `conversionThreshold`, `notifyFees` в той же транзакции зовёт
-   `Vault.convertFees(meme)`: волт меняет весь USDG эпохи на наградные активы по весам через swap
-   adapter и закрывает эпоху. Газ платит свапер, чей своп пересёк порог. Конверсия обёрнута в
-   try/catch: если своп в адаптере не прошёл, начисление остаётся, эмитится `ConversionFailed`, и
-   следующая попытка будет не раньше чем через `CONVERSION_COOLDOWN`.
-   **Газ под конвертацию.** Из-за try/catch нехватка газа в конвертации не откатывала бы своп, и
-   оценка газа кошельков, роутеров и 0x находила бы лимит, при котором конвертация всегда тихо
-   умирает по газу. Поэтому хук перед выплатой спрашивает у волта `conversionGasRequired(meme)`
-   и откатывает своп с `NotEnoughGasForConversion(needed, available)`, если газа меньше нужного с
-   учётом правила 63/64 на трёх вложенных вызовах. Оценка газа тогда сама поднимает лимит.
-   Ответ волта ограничен сверху `MAX_CONVERSION_GAS` (3M, реальный максимум волта 2.55M при 8
-   активах): волт с завышенной оценкой не может заблокировать торговлю, конвертация, которой газа
-   не хватит, упадёт внутри try/catch, и комиссия останется накопленной. Оба вызова волта из
-   свопа ограничены по газу: запрос оценки — `CONVERSION_QUERY_GAS` (100k), выплата — ровно
-   оценкой плюс `PAYOUT_GAS_OVERHEAD`. Волт, который сжигает весь полученный газ, удорожает своп
-   не больше чем на это значение, но не блокирует его.
-   Требование действует на **каждый** своп мема с включённой автоконвертацией, а не только на
-   пересекающий порог: иначе своп, оценённый при далёком пороге, падал бы, если до его включения
-   в блок чужие сделки почти набрали порог. Платится только израсходованный газ.
-   Бюджет: `CONVERSION_BASE_GAS` (150k) + `CONVERSION_GAS_PER_SWAP` (300k) на каждый актив,
-   кроме USDG, плюс `PAYOUT_GAS_OVERHEAD` (300k; самая тяжёлая выплата с разбивкой в волте ~240k) хука. Замер на Robinhood Chain: конвертация
-   в два актива через Uniswap V3 стоит 570k–660k. При пороге 0 (автоконвертация выключена)
-   требования нет. `convertFees` может вызвать кто угодно
-   при том же условии по порогу, это страховка, если автоматика застряла. Защита цены живёт в
-   адаптере: минимальный выход считается от TWAP пула за вычетом комиссии пула и допуска на
-   актив. Только после закрытия эпохи начисления становятся claimable, уже в купленных активах.
+5. **Conversion.** An epoch is closed by a threshold, there is no keeper. As soon as the USDG accumulated in the open
+   epoch reaches `conversionThreshold`, `notifyFees` in the same transaction calls
+   `Vault.convertFees(meme)`: the vault swaps all the epoch's USDG for reward assets by weight through the swap
+   adapter and closes the epoch. Gas is paid by the swapper whose swap crossed the threshold. The conversion is wrapped in
+   try/catch: if the swap in the adapter fails, the accrual stays, `ConversionFailed` is emitted, and
+   the next attempt is no sooner than `CONVERSION_COOLDOWN`.
+   **Gas for conversion.** Because of try/catch, running out of gas inside the conversion would not revert the swap, and
+   gas estimation in wallets, routers and 0x would find a limit at which the conversion always silently
+   dies of gas. So before paying out, the hook asks the vault for `conversionGasRequired(meme)`
+   and reverts the swap with `NotEnoughGasForConversion(needed, available)` if there is less gas than needed,
+   taking the 63/64 rule over three nested calls into account. Gas estimation then raises the limit by itself.
+   The vault's answer is capped at `MAX_CONVERSION_GAS` (3M; the real vault maximum is 2.55M with 8
+   assets): a vault with an inflated estimate cannot block trading, and a conversion that lacks gas
+   fails inside try/catch and the fee stays accumulated. Both vault calls from a
+   swap are gas-limited: the estimate query — `CONVERSION_QUERY_GAS` (100k), the payout — exactly the
+   estimate plus `PAYOUT_GAS_OVERHEAD`. A vault that burns all the gas it receives makes a swap more expensive
+   by no more than that value, but does not block it.
+   The requirement applies to **every** swap of a meme with auto-conversion enabled, not only the one
+   crossing the threshold: otherwise a swap estimated while the threshold was far would fail if, before it was included
+   in a block, other trades had almost reached the threshold. Only the gas actually used is paid.
+   Budget: `CONVERSION_BASE_GAS` (150k) + `CONVERSION_GAS_PER_SWAP` (300k) per asset
+   except USDG, plus the hook's `PAYOUT_GAS_OVERHEAD` (300k; the heaviest payout with a split in the vault is ~240k). Measured on Robinhood Chain: a conversion
+   into two assets through Uniswap V3 costs 570k–660k. With threshold 0 (auto-conversion off)
+   there is no requirement. Anyone can call `convertFees`
+   under the same threshold condition, as insurance if the automation gets stuck. Price protection lives in the
+   adapter: the minimum output is computed from the pool TWAP minus the pool fee and a per-asset
+   tolerance. Only after the epoch is closed do the accruals become claimable, already in the purchased assets.
 
-6. **Стейкеры и создатель.** Держатели мема стейкают его через `stake` или `stakeWithPermit`,
-   забирают награды через `claim` целиком или по выбранным активам, снимают стейк через `unstake`
-   с сохранением наград, либо `exit` для всего сразу. `unstake` работает даже на паузе.
-   Создатель получает долю через `claimCreatorRewards`, вызвать может любой, деньги всегда
-   идут текущему создателю. Роль создателя передаётся в два шага: `transferCreator`,
+6. **Stakers and creator.** Meme holders stake via `stake` or `stakeWithPermit`,
+   claim rewards via `claim` in full or for selected assets, unstake via `unstake`
+   keeping their rewards, or `exit` for everything at once. `unstake` works even when paused.
+   The creator gets their share via `claimCreatorRewards`; anyone can call it, the funds always
+   go to the current creator. The creator role is transferred in two steps: `transferCreator`,
    `acceptCreator`.
 
-### Рефералы
+### Referrals
 
-`GmoonReferrals` стоит получателем протокола в волте (`Vault.protocolRecipient`) и получает всю
-протокольную долю комиссий. `notifyFee` он принимает от волта (`setVault`), а также от хуков
-старой схемы, которые сами платили протокольную долю (`isFeeSource`).
+`GmoonReferrals` is set as the protocol recipient in the vault (`Vault.protocolRecipient`) and receives the whole
+protocol share of fees. It accepts `notifyFee` from the vault (`setVault`) and also from old-scheme
+hooks that paid the protocol share themselves (`isFeeSource`).
 
-1. Реферер регистрирует код: `registerCode("code")`, 1..32 символа `[a-z0-9_-]`, первый занявший
-   владеет кодом навсегда, кодов у одного реферера может быть несколько.
-2. Пользователь привязывается: `useCode("code")`. Один раз и навсегда, себя привести нельзя. По
-   одному коду приводится сколько угодно пользователей.
-3. `deployToken` зовёт `registerToken(meme, msg.sender)`: мем закрепляется за реферером
-   **деплоера** на момент деплоя. Привязка, сделанная позже, на уже созданные мемы не действует.
-4. На каждой выплате волт переводит протокольную долю и зовёт `notifyFee`. Рефереру мема
-   начисляется `amount * refShareBips / 10000` (по умолчанию 25% протокольной доли, округление
-   вниз в пользу протокола). Мемы без реферера и неизвестные мемы целиком идут протоколу.
-5. Выплаты рефереру: `claim()` сам или `distribute(address[])` кто угодно (деньги уходят только
-   самим реферерам, нулевые и повторы пропускаются).
-6. Протокол: `withdrawProtocolFees(to)` (только владелец) забирает `balance - totalPending`, то
-   есть всё, кроме долга рефералам.
+1. A referrer registers a code: `registerCode("code")`, 1..32 characters `[a-z0-9_-]`, the first to claim
+   a code owns it forever, one referrer may have several codes.
+2. A user binds with `useCode("code")`. Once and forever, you cannot refer yourself. Any number of
+   users can be referred by one code.
+3. `deployToken` calls `registerToken(meme, msg.sender)`: the meme is attached to the **deployer's**
+   referrer at deploy time. A binding made later does not affect memes already created.
+4. On each payout the vault transfers the protocol share and calls `notifyFee`. The meme's referrer
+   is credited `amount * refShareBips / 10000` (by default 25% of the protocol share, rounded
+   down in favour of the protocol). Memes without a referrer and unknown memes go entirely to the protocol.
+5. Referrer payouts: `claim()` by the referrer or `distribute(address[])` by anyone (funds go only to
+   the referrers themselves, zeros and duplicates are skipped).
+6. Protocol: `withdrawProtocolFees(to)` (owner only) withdraws `balance - totalPending`, i.e.
+   everything except the debt to referrers.
 
-Пауза (`setPaused`) останавливает только `claim` и `distribute`. Начисление, регистрация кодов и
-`withdrawProtocolFees` работают всегда, поэтому пауза не ломает выплаты комиссий и не блокирует
-протокол. Инвариант: `balanceOf(referrals) >= totalPending`, проверяется на каждом начислении;
-`notifyFee` без реального перевода откатывается `BalanceTooLow`. `refShareBips` глобальный и
-применяется к комиссиям, пришедшим после изменения.
+Pause (`setPaused`) stops only `claim` and `distribute`. Accrual, code registration and
+`withdrawProtocolFees` always work, so a pause neither breaks fee payouts nor blocks the
+protocol. Invariant: `balanceOf(referrals) >= totalPending`, checked on every accrual;
+`notifyFee` without an actual transfer reverts with `BalanceTooLow`. `refShareBips` is global and
+applies to fees that arrive after the change.
 
-### Swap adapter: почему Uniswap V3
+### Swap adapter: why Uniswap V3
 
-Волт знает только интерфейс `ISwapAdapter`: отдать USDG, получить актив на свой баланс, выход
-меряется разницей баланса. Какой DEX за этим стоит, волту всё равно, адаптер меняется через
-`setSwapAdapter`. Текущая реализация `UniswapV3SwapAdapter` выбрана по трём причинам:
+The vault knows only the `ISwapAdapter` interface: give USDG, receive the asset to its own balance, the output is
+measured by the balance difference. The vault does not care which DEX is behind it; the adapter is replaced via
+`setSwapAdapter`. The current `UniswapV3SwapAdapter` implementation was chosen for three reasons:
 
-- **Ликвидность наградных активов.** Пулы USDG/актив для токенизированных акций и wBTC живут в
-  Uniswap V3. Пулы V4 в протоколе только Meme/USDG с хуком Gemoon, под наградные активы они не
-  предназначены.
-- **Встроенный оракул.** Кипера нет, поэтому минимальный выход считается ончейн, и нужна опорная
-  цена. У пула V3 она есть из коробки: `observe` отдаёт накопленные тики, из них считается TWAP за
-  окно. У V4 встроенного оракула нет, пришлось бы ставить отдельный хук-оракул на каждый пул или
-  зависеть от Chainlink, которого на токенизированные акции может не быть.
-- **Фабрика вместо адреса пула.** `setRoute(asset, fee, slippage)` спрашивает пул у фабрики по
-  тройке (USDG, актив, fee-tier). Владелец не может подставить произвольный контракт вместо пула, а
-  `fee` гарантированно совпадает с реальной комиссией пула, которую адаптер вычитает из котировки.
-  Адрес фабрики immutable.
+- **Reward-asset liquidity.** USDG/asset pools for tokenized stocks and wBTC live in
+  Uniswap V3. The protocol's V4 pools are only Meme/USDG with the Gemoon hook and are not
+  meant for reward assets.
+- **Built-in oracle.** There is no keeper, so the minimum output is computed on-chain and a reference
+  price is needed. A V3 pool has one out of the box: `observe` returns accumulated ticks, from which a TWAP over the
+  window is computed. V4 has no built-in oracle; we would need an oracle hook on every pool or
+  depend on Chainlink, which may not exist for tokenized stocks.
+- **Factory instead of a pool address.** `setRoute(asset, fee, slippage)` asks the factory for the pool by the
+  triple (USDG, asset, fee tier). The owner cannot substitute an arbitrary contract for a pool, and the
+  `fee` is guaranteed to match the pool's real fee, which the adapter subtracts from the quote.
+  The factory address is immutable.
 
-Если на целевой сети ликвидность USDG/актив окажется в другом месте, пишется другой адаптер под
-тот же интерфейс с собственным источником цены, волт и его учёт не меняются.
+If on the target network USDG/asset liquidity turns out to be elsewhere, another adapter is written for
+the same interface with its own price source; the vault and its accounting do not change.
 
-### Администрирование
+### Administration
 
-- **Токен.** Админы меняют картинку и описание, состав админов меняется через
-  `GemoonController.changeAdmin`. Вызывать его может только админ этого мема: сам мем видит
-  вызывающим контроллер, тоже своего админа, поэтому вызывающего проверяет контроллер.
-- **Волт.** Владелец управляет allowlist активов, порогом конверсии, swap adapter, паузой, а
-  также разбивкой комиссии: долей протокола (`setProtocolShare`, 0..100% комиссии, сразу для всех
-  мемов) и её получателем (`setProtocolRecipient`). Владелец волта по итогам `TransferToGovernance`
-  — Safe без таймлока, поэтому смена доли протокола вступает в силу без задержки.
-  Порог 0 отключает автоматическую конверсию. Пауза останавливает стейк, клейм и конвертацию,
-  но не приём комиссий и не вывод стейка. `rescueERC20` для ошибочно присланных токенов.
-- **Swap adapter.** Владелец задаёт маршрут на каждый актив: fee-tier пула USDG/актив из
-  фабрики Uniswap V3 и допуск от TWAP в bps, не больше 10%. Окно TWAP общее, от 1 минуты до часа.
-  `sweep` забирает остатки с адаптера, между свопами он ничего не хранит.
-- **Хук.** Владельца нет, админ-функций нет (версия 3). Волт, контроллер и ставки комиссии заданы
-  в конструкторе и не меняются; разбивка комиссии живёт в волте. Волт и контроллер — прокси, их
-  апгрейды хук не затрагивают; другой адрес волта или контроллера требует нового хука.
-- **Контроллер.** Владелец меняет хук, волт, PositionManager с Permit2, контракт рефералов
-  (`setReferrals`, ноль выключает регистрацию), TokenDeployer (`setTokenDeployer`) и выводит
-  средства с самого контроллера.
-- **TokenDeployer.** Владельца нет, админ-функций нет: контроллер задан в конструкторе, код токена
-  зашит в байткод. Код токенов новых мемов меняется заменой деплоера: `make deploy-token-deployer`
-  (скрипт `DeployTokenDeployer`) деплоит новый TokenDeployer с кодом токена текущего коммита и, если
-  broadcaster владеет контроллером, сразу зовёт `setTokenDeployer`; иначе печатает вызов для
-  владельца (после `TransferToGovernance` — вызов от Safe). Контроллер при этом не обновляется,
-  уже созданные мемы не меняются. `setTokenDeployer` принимает только деплоер, привязанный к этому
-  контроллеру (`TokenDeployerControllerMismatch`). Новый код токена — доверенный: контроллер
-  проверяет только, что вся эмиссия пришла ему, всё остальное (например, отсутствие доп. минта)
-  ревьюится перед `setTokenDeployer` так же, как апгрейд контроллера. Конструктор токена нового
-  кода должен минтить всю эмиссию `INITIAL_SUPPLY_X18` вызывающему `deployToken` (контроллеру).
-- **Рефералы.** Владелец меняет `refShareBips` (не больше 100%), волт (`setVault`), хук, контроллер, ставит выплаты
-  рефералам на паузу, выводит протокольную часть и спасает чужие токены (`rescueERC20`, кроме
-  pair-токена).
-- **Апгрейды.** Каждый прокси обновляется через свой ProxyAdmin скриптами `ProxyVaultUpgrade`,
-  `ProxyGemoonControllerUpgrade`, `ProxyReferralsUpgrade`. **HookManager не обновляемый:** у него
-  нет прокси и ProxyAdmin, код и ставки комиссии (`TOTAL_FEE_BIPS`, `MAX_FEE_BIPS`, границы ставки
-  мема) зафиксированы при деплое. Разбивки комиссии в хуке нет: всё уходит в обновляемый волт.
-  Владельца у хука нет: перенаправить комиссии или сменить контроллер нельзя, поднять комиссию
-  живого пула не может никто. Новая версия хука — новый контракт по новому адресу: пулы
-  уже созданных мемов остаются на старом хуке, к новому переходят только новые мемы. Смена хука в
-  существующем деплое: `make deploy-hook` (скрипт `DeployHook`: деплой, `Vault.setHook`,
-  `Controller.setHook`, проверка связки), затем `make deploy-lens` (Lens хранит адрес хука).
-  Волт и рефералы продолжают принимать комиссии от всех хуков, назначенных раньше (`isHook`),
-  контроллер запоминает хук каждого мема (`hookOf`), GemoonLens читает каждый мем через его хук.
-  Отозвать старый хук нельзя: иначе комиссии его мемов застряли бы. `VerifyWiring`
-  проверяет, что связка цела (рефералы — если задан `REFERRALS_PROXY_ADDRESS`).
+- **Token.** Admins change the image and description; the admin set is changed through
+  `GemoonController.changeAdmin`. Only an admin of that meme can call it: the meme itself sees the
+  controller as the caller, which is also its admin, so the controller checks the caller.
+- **Vault.** The owner manages the asset allowlist, conversion threshold, swap adapter, pause, and also
+  the fee split: the protocol share (`setProtocolShare`, 0..100% of the fee, immediately for all
+  memes) and its recipient (`setProtocolRecipient`). After `TransferToGovernance` the vault owner
+  is a Safe without a timelock, so a change of the protocol share takes effect without delay.
+  Threshold 0 disables automatic conversion. Pause stops staking, claiming and conversion,
+  but not fee intake or unstaking. `rescueERC20` for tokens sent by mistake.
+- **Swap adapter.** The owner sets a route per asset: the fee tier of the USDG/asset pool from the
+  Uniswap V3 factory and the tolerance from the TWAP in bps, no more than 10%. The TWAP window is shared, from 1 minute to an hour.
+  `sweep` withdraws leftovers from the adapter; between swaps it holds nothing.
+- **Hook.** No owner, no admin functions (version 3). The vault, controller and fee rates are set
+  in the constructor and never change; the fee split lives in the vault. The vault and controller are proxies, their
+  upgrades do not affect the hook; a different vault or controller address requires a new hook.
+- **Controller.** The owner changes the hook, vault, PositionManager with Permit2, the referrals contract
+  (`setReferrals`, zero disables registration), the TokenDeployer (`setTokenDeployer`) and withdraws
+  funds held by the controller itself.
+- **TokenDeployer.** No owner, no admin functions: the controller is set in the constructor, the token code
+  is baked into the bytecode. The token code of new memes changes by replacing the deployer: `make deploy-token-deployer`
+  (script `DeployTokenDeployer`) deploys a new TokenDeployer with the token code of the current commit and, if the
+  broadcaster owns the controller, immediately calls `setTokenDeployer`; otherwise it prints the call for the
+  owner (after `TransferToGovernance` — a call from the Safe). The controller is not upgraded,
+  already created memes do not change. `setTokenDeployer` accepts only a deployer bound to this
+  controller (`TokenDeployerControllerMismatch`). The new token code is trusted: the controller
+  only checks that the whole supply reached it; everything else (e.g. the absence of extra minting)
+  is reviewed before `setTokenDeployer` just like a controller upgrade. The new token's constructor
+  must mint the whole `INITIAL_SUPPLY_X18` to the caller of `deployToken` (the controller).
+- **Referrals.** The owner changes `refShareBips` (at most 100%), the vault (`setVault`), hook, controller, pauses payouts
+  to referrals, withdraws the protocol part and rescues foreign tokens (`rescueERC20`, except the
+  pair token).
+- **Upgrades.** Each proxy is upgraded through its own ProxyAdmin with the scripts `ProxyVaultUpgrade`,
+  `ProxyGemoonControllerUpgrade`, `ProxyReferralsUpgrade`. **HookManager is not upgradeable:** it has
+  no proxy or ProxyAdmin; the code and fee rates (`TOTAL_FEE_BIPS`, `MAX_FEE_BIPS`, the meme
+  rate bounds) are fixed at deploy time. There is no fee split in the hook: everything goes to the upgradeable vault.
+  The hook has no owner: fees cannot be redirected or the controller changed, and nobody can raise the fee
+  of a live pool. A new hook version is a new contract at a new address: pools of
+  already created memes stay on the old hook, only new memes move to the new one. Changing the hook in an
+  existing deployment: `make deploy-hook` (script `DeployHook`: deploy, `Vault.setHook`,
+  `Controller.setHook`, wiring check), then `make deploy-lens` (the Lens stores the hook address).
+  The vault and referrals keep accepting fees from all hooks assigned earlier (`isHook`),
+  the controller remembers each meme's hook (`hookOf`), and GemoonLens reads each meme through its hook.
+  An old hook cannot be revoked: otherwise its memes' fees would get stuck. `VerifyWiring`
+  checks that the wiring is intact (referrals — if `REFERRALS_PROXY_ADDRESS` is set).
 
-### GemoonLens: батч-чтения для фронтенда
+### GemoonLens: batch reads for the frontend
 
-Фронтенд читает состояние не сотнями `eth_call`, а одним вызовом на экран. Все функции `view`,
-принимают массив адресов, результат в порядке входа, дубликаты допустимы.
+The frontend reads state not with hundreds of `eth_call`s but with one call per screen. All functions are `view`,
+take an array of addresses, the result is in input order, duplicates are allowed.
 
-| Функция | Что возвращает | Экран |
+| Function | Returns | Screen |
 |---|---|---|
-| `tokens(address[] memes, address account)` → `TokenView[]` | метаданные, рынок, публичное состояние волта, позиция `account` | Explore, страница токена, стейкинг |
-| `markets(address[] memes)` → `(TokenMarket[], uint256[] staked)` | только рынок и `totalStaked`, без строк | периодическое обновление цен |
-| `totalStaked(address[] memes)` → `uint256[]` | `vault.totalStaked` по каждому | hero-статистика |
-| `quotes(address[] assets, uint256 amountIn)` → `(uint256[], bool[] ok)` | сколько ассета даёт `amountIn` USDG по текущему адаптеру | оценка наград в USD |
-| `protocol()` | USDG (адрес, decimals, symbol), адаптер, порог и cooldown конверсии, хук, PoolManager | один раз на сессию |
-| `creator(address meme)` → `(creatorOf, assets[], accrued[])` | создатель волта и его начисленная доля | блок Creator rewards |
-| `creators(address[] memes)` → `CreatorRewards[]` | то же для списка мемов, с флагом `ok` | создатель с несколькими мемами |
+| `tokens(address[] memes, address account)` → `TokenView[]` | metadata, market, public vault state, the position of `account` | Explore, token page, staking |
+| `markets(address[] memes)` → `(TokenMarket[], uint256[] staked)` | market and `totalStaked` only, no strings | periodic price refresh |
+| `totalStaked(address[] memes)` → `uint256[]` | `vault.totalStaked` for each | hero statistics |
+| `quotes(address[] assets, uint256 amountIn)` → `(uint256[], bool[] ok)` | how much of an asset `amountIn` USDG buys at the current adapter | reward valuation in USD |
+| `protocol()` | USDG (address, decimals, symbol), adapter, conversion threshold and cooldown, hook, PoolManager | once per session |
+| `creator(address meme)` → `(creatorOf, assets[], accrued[])` | the vault's creator and their accrued share | Creator rewards block |
+| `creators(address[] memes)` → `CreatorRewards[]` | the same for a list of memes, with an `ok` flag | a creator with several memes |
 
-Пул мема считается так же, как в контроллере: `PoolKey{sort(USDG, meme), fee 0, tickSpacing 200,
-hooks = HookManager}`, `poolId = keccak256(abi.encode(key))`, цена из slot0 PoolManager (то же, что
-`StateView.getSlot0`). USDG и адаптер читаются из волта при каждом вызове.
+A meme's pool is derived the same way as in the controller: `PoolKey{sort(USDG, meme), fee 0, tickSpacing 200,
+hooks = HookManager}`, `poolId = keccak256(abi.encode(key))`, the price from the PoolManager's slot0 (same as
+`StateView.getSlot0`). USDG and the adapter are read from the vault on every call.
 
-**Флаги и нули.** Ни один сбой не ломает батч: неудачное чтение даёт ноль, а там, где ноль —
-допустимое значение, ещё и флаг `false`.
+**Flags and zeros.** No failure breaks the batch: a failed read yields zero, and where zero is a
+valid value, also a `false` flag.
 
-| Поле | Когда `false` / ноль | Что показывать |
+| Field | When `false` / zero | What to show |
 |---|---|---|
-| `meta.ok` | у адреса нет кода или `totalSupply()` не ответил | токена нет; заполнены только `meme`, `market.poolId`, `market.memeIsToken0` |
-| `meta.decimalsOk` | нет `decimals()` или ответ не влезает в uint8 | `–` вместо сумм |
-| `meta.creatorOk` | нет `creator()` (старые токены) или ответ не адрес | `–` |
-| `meta.socialOk` | нет `getSocialMedia()` или хоть одна из четырёх строк некорректна; тогда все четыре пустые | ссылки не показывать |
-| `name`, `symbol`, `description`, `image` | функции нет, revert или ответ не ABI-строка (например `bytes32`-имя) | пустая строка |
-| `market.sqrtPriceX96 == 0` | пул не создан или не инициализирован | нет цены |
-| `market.burnedOk` | хотя бы один `balanceOf` (0x0 или 0xdEaD) не ответил; `burned` = 0 | `–` |
-| `market.pendingFeesOk` | `hook.pendingFees` не ответил | `–` |
-| `vault.registeredOk` | `vault.isRegistered` не ответил; `registered = false` значит «неизвестно», а не «нет волта» | `–` |
-| `vault.assets[i].symbolOk`, `decimalsOk` | у ассета нет `symbol()`/`decimals()` или ответ некорректный | `–` |
-| `vault.registered == false` при `registeredOk` | у мема нет волта (не создан через контроллер) | все поля волта и вызовы по волту пропущены |
-| `position` | `account == address(0)` | нули, вызовы по аккаунту не выполняются |
-| `quotes` `ok[i]` | у адаптера нет маршрута, адаптер не задан или упал | `–`; USDG всегда 1:1 с `ok = true` |
-| `creators` `ok` | волт не ответил на `creatorOf` или `creatorAccrued` | `–` |
+| `meta.ok` | the address has no code or `totalSupply()` did not answer | no token; only `meme`, `market.poolId`, `market.memeIsToken0` are filled |
+| `meta.decimalsOk` | no `decimals()` or the answer does not fit in uint8 | `–` instead of amounts |
+| `meta.creatorOk` | no `creator()` (old tokens) or the answer is not an address | `–` |
+| `meta.socialOk` | no `getSocialMedia()` or at least one of the four strings is invalid; then all four are empty | do not show links |
+| `name`, `symbol`, `description`, `image` | no function, revert, or the answer is not an ABI string (e.g. a `bytes32` name) | empty string |
+| `market.sqrtPriceX96 == 0` | the pool is not created or not initialized | no price |
+| `market.burnedOk` | at least one `balanceOf` (0x0 or 0xdEaD) did not answer; `burned` = 0 | `–` |
+| `market.pendingFeesOk` | `hook.pendingFees` did not answer | `–` |
+| `vault.registeredOk` | `vault.isRegistered` did not answer; `registered = false` means "unknown", not "no vault" | `–` |
+| `vault.assets[i].symbolOk`, `decimalsOk` | the asset has no `symbol()`/`decimals()` or the answer is invalid | `–` |
+| `vault.registered == false` with `registeredOk` | the meme has no vault (not created through the controller) | all vault fields and vault calls are skipped |
+| `position` | `account == address(0)` | zeros, per-account calls are not made |
+| `quotes` `ok[i]` | the adapter has no route, no adapter set, or it failed | `–`; USDG is always 1:1 with `ok = true` |
+| `creators` `ok` | the vault did not answer `creatorOf` or `creatorAccrued` | `–` |
 
-`vault.registered == true` — единственный признак того, что адрес действительно мем этого
-протокола: Lens читает любой адрес, который ему передали. Строки `description`/`image` задаёт
-создатель мема, фронт обязан их экранировать.
+`vault.registered == true` is the only sign that an address really is a meme of this
+protocol: the Lens reads any address it is given. The `description`/`image` strings are set by the
+meme creator; the frontend must escape them.
 
-**Предельные размеры батчей** (газ «холодного» вызова, как у настоящего `eth_call`; у нод лимит
-обычно 50M, ТЗ требует 30M для `tokens` и 15M для `markets`/`totalStaked`):
+**Batch size limits** (cold-call gas, like a real `eth_call`; nodes usually cap it at 50M, the spec
+requires 30M for `tokens` and 15M for `markets`/`totalStaked`):
 
-| Вызов | Газ | Источник |
+| Call | Gas | Source |
 |---|---|---|
-| `tokens(70, account)`, 5 ассетов, стейк, соцсети, описание 280 Б, картинка 120 Б | 18.4M | `GemoonLensGasTest` |
-| `tokens(70, 0x0)`, то же | 14.5M | `GemoonLensGasTest` |
-| `tokens(70, account)`, 70 реальных мемов devnet | 14.2M | `GemoonLensDevnetForkTest` |
-| `tokens(70, account)`, 5 ассетов, описание и картинка **по 2 КБ** | 40.8M | `GemoonLensGasTest` |
-| `tokens(50, account)`, строки по 2 КБ | 27.5M | `GemoonLensGasTest` |
+| `tokens(70, account)`, 5 assets, stake, socials, 280 B description, 120 B image | 18.4M | `GemoonLensGasTest` |
+| `tokens(70, 0x0)`, same | 14.5M | `GemoonLensGasTest` |
+| `tokens(70, account)`, 70 real devnet memes | 14.2M | `GemoonLensDevnetForkTest` |
+| `tokens(70, account)`, 5 assets, description and image **2 KB each** | 40.8M | `GemoonLensGasTest` |
+| `tokens(50, account)`, strings of 2 KB | 27.5M | `GemoonLensGasTest` |
 | `markets(200)` | 6.0M | `GemoonLensGasTest` |
 | `totalStaked(200)` | 1.4M | `GemoonLensGasTest` |
-| `creators(70)`, реальные мемы devnet | 2.3M | `GemoonLensDevnetForkTest` |
+| `creators(70)`, real devnet memes | 2.3M | `GemoonLensDevnetForkTest` |
 
-Рекомендуемые чанки: `tokens` — **50 адресов** (держит 30M даже при строках по 2 КБ; при обычной
-длине строк 70 укладываются с запасом), `markets`/`totalStaked` — 200. На 2 КБ-строках
-около 60% газа токена уходит на чтение самих строк из хранилища (128 холодных SLOAD), сократить
-это в Lens нельзя. Полный отчёт `forge test --gas-report`: `docs/gemoon-lens-gas-report.txt`.
+Recommended chunks: `tokens` — **50 addresses** (stays within 30M even with 2 KB strings; with typical
+string lengths 70 fit with headroom), `markets`/`totalStaked` — 200. With 2 KB strings
+about 60% of a token's gas goes to reading the strings from storage (128 cold SLOADs); the Lens cannot
+reduce this. Full `forge test --gas-report` output: `docs/gemoon-lens-gas-report.txt`.
 
-**Деплой.** `make deploy-lens` (`script/DeployLens.s.sol`): берёт `CONTROLLER_PROXY_ADDRESS`,
-`VAULT_PROXY_ADDRESS`, `HOOK_ADDRESS`, `POOL_MANAGER` и `LENS_SALT` (по умолчанию 0) из
-`env/<ENVIRONMENT>.mk`, проверяет, что контроллер, волт, хук и PoolManager указывают друг на друга, и деплоит через
-CREATE2-фабрику `0x4e59b44847b379578588920cA78FbF26c0B4956C`. Адрес зависит только от соли,
-аргументов и байткода, поэтому после сброса форка та же команда поднимает Lens по тому же адресу,
-а если он уже есть, ничего не отправляет. Байткод меняется при любой правке контракта или настроек
-компилятора — тогда меняется и адрес. Обычная транзакция, без `anvil_*`.
+**Deployment.** `make deploy-lens` (`script/DeployLens.s.sol`): takes `CONTROLLER_PROXY_ADDRESS`,
+`VAULT_PROXY_ADDRESS`, `HOOK_ADDRESS`, `POOL_MANAGER` and `LENS_SALT` (default 0) from
+`env/<ENVIRONMENT>.mk`, checks that the controller, vault, hook and PoolManager point at each other, and deploys through the
+CREATE2 factory `0x4e59b44847b379578588920cA78FbF26c0B4956C`. The address depends only on the salt,
+arguments and bytecode, so after a fork reset the same command brings the Lens up at the same address,
+and if it already exists, sends nothing. The bytecode changes with any contract edit or compiler
+setting change — and then the address changes too. A regular transaction, no `anvil_*`.
 
-Devnet (chain 1488): `0xf5e9342Ffe373D9a3B4a986870cbC6E66dDCbF15`, блок 84351591
-(tx `0xefea4f43376ea117553188d801761d721830cbe6c80b8597c4dfa8aa54940e10`), в `env/dev.mk` — `LENS_ADDRESS`.
-Первая версия без соцсетей, флагов ассетов и `creators` осталась на `0x43A7E53e63A834c3FB7FcE55d84F2879cB5A82Ec` (блок 84351590),
-у неё другой ABI.
+Devnet (chain 1488): `0xf5e9342Ffe373D9a3B4a986870cbC6E66dDCbF15`, block 84351591
+(tx `0xefea4f43376ea117553188d801761d721830cbe6c80b8597c4dfa8aa54940e10`), `LENS_ADDRESS` in `env/dev.mk`.
+The first version, without socials, asset flags and `creators`, remains at `0x43A7E53e63A834c3FB7FcE55d84F2879cB5A82Ec` (block 84351590);
+it has a different ABI.
 
-## Параметры протокола
+## Protocol parameters
 
-| Параметр | Значение | Где |
+| Parameter | Value | Where |
 |---|---|---|
-| Эмиссия мема | 1 000 000 000 токенов, 18 знаков | `INITIAL_SUPPLY_X18`, `IGemoon.sol` |
-| Стартовая капитализация | 20 000 USDG | `INITIAL_MARKET_CAP`, `IGemoon.sol` |
-| Стартовая цена | 50 000 целых мемов за 1 целый USDG (эмиссия / стартовая капитализация); decimals обоих токенов читаются при создании пула, порядок token0/token1 на цену не влияет | `PRICE_PER_TOKEN`, `IGemoon.sol`; `_configurePool`, `Gemoon.sol` |
+| Meme supply | 1 000 000 000 tokens, 18 decimals | `INITIAL_SUPPLY_X18`, `IGemoon.sol` |
+| Initial market cap | 20 000 USDG | `INITIAL_MARKET_CAP`, `IGemoon.sol` |
+| Initial price | 50 000 whole memes per 1 whole USDG (supply / initial market cap); the decimals of both tokens are read when the pool is created, the token0/token1 order does not affect the price | `PRICE_PER_TOKEN`, `IGemoon.sol`; `_configurePool`, `Gemoon.sol` |
 | Tick spacing | 200 | `TICK_SPACING`, `IGemoon.sol` |
-| LP fee пула | 0, комиссию берёт хук | `Gemoon.sol` |
-| Комиссия мема | 1%..5%, выбирает создатель в `deployToken` | `MIN_MEME_FEE_BIPS`, `MAX_MEME_FEE_BIPS`, `HookManager.sol` |
-| Доля протокола | четверть (2500 bps) от каждой выплаты комиссии (включая анти-снайп надбавку), остальное мему; хранится в волте, владелец волта меняет её глобально, не больше 100% | `protocolShareBps`, `setProtocolShare`, `Vault.sol` |
-| Резервная комиссия | 1.25% для мемов, о которых контроллер не сообщил; задаётся в конструкторе и не меняется | `TOTAL_FEE_BIPS`, конструктор `HookManager` |
-| Анти-снайп комиссия | 80% в момент создания пула, линейно до базовой за 15 секунд; dev buy платит базовую | `MAX_FEE_BIPS`, `DYNAMIC_FEE_THRESHOLD`, `HookManager.sol` |
-| Dev buy | до 80% эмиссии, exact output, в транзакции `deployToken` | `MAX_DEV_BUY_BIPS`, `MAX_DEV_BUY_X18`, `IGemoon.sol` |
-| Доля создателя | 0..50% от каждой комиссии волта (`MAX_CREATOR_SHARE_BPS` = 5000), выбирает создатель в `deployToken`, после регистрации не меняется | `VaultInfo.creatorShareBps`, `creatorShareBpsOf`, `MAX_CREATOR_SHARE_BPS`, `Vault.sol` |
-| Реферальная доля | 25% (2500 bips) протокольной доли мема реферала, задаётся владельцем, не больше 100% | `refShareBips`, `Referrals.sol` |
-| Реферальный код | 1..32 символа `[a-z0-9_-]` | `MAX_CODE_LENGTH`, `Referrals.sol` |
-| Наградных активов на волт | до 8 | `MAX_ASSETS`, `Vault.sol` |
-| Порог конверсии эпохи | задаётся владельцем в единицах USDG, 0 выключает автоматику | `setConversionThreshold`, `Vault.sol` |
-| Кулдаун после неудачной конверсии | 1 минута | `CONVERSION_COOLDOWN`, `Vault.sol` |
-| Газ под конвертацию | 150k + 300k на каждый актив кроме USDG, плюс 300k на выплату (разбивка в волте, перевод протоколу и `notifyFee` рефералов); любой своп мема при пороге > 0 без такого лимита откатывается, платится только израсходованный газ | `CONVERSION_BASE_GAS`, `CONVERSION_GAS_PER_SWAP`, `Vault.sol`; `PAYOUT_GAS_OVERHEAD`, `HookManager.sol` |
-| Допуск от TWAP на актив | задаётся владельцем адаптера, рекомендуемо 1%, потолок 10% | `setRoute`, `MAX_SLIPPAGE_BPS`, `UniswapV3SwapAdapter.sol` |
-| Окно TWAP | 1 минута … 1 час, по умолчанию 10 минут в скрипте | `setTwapWindow`, `UniswapV3SwapAdapter.sol` |
+| Pool LP fee | 0, the fee is taken by the hook | `Gemoon.sol` |
+| Meme fee | 1%..5%, chosen by the creator in `deployToken` | `MIN_MEME_FEE_BIPS`, `MAX_MEME_FEE_BIPS`, `HookManager.sol` |
+| Protocol share | a quarter (2500 bps) of every fee payout (including the anti-snipe surcharge), the rest to the meme; stored in the vault, the vault owner changes it globally, at most 100% | `protocolShareBps`, `setProtocolShare`, `Vault.sol` |
+| Fallback fee | 1.25% for memes the controller did not report; set in the constructor and never changes | `TOTAL_FEE_BIPS`, `HookManager` constructor |
+| Anti-snipe fee | 80% at pool creation, linearly to the base rate over 15 seconds; dev buy pays the base rate | `MAX_FEE_BIPS`, `DYNAMIC_FEE_THRESHOLD`, `HookManager.sol` |
+| Dev buy | up to 80% of the supply, exact output, in the `deployToken` transaction | `MAX_DEV_BUY_BIPS`, `MAX_DEV_BUY_X18`, `IGemoon.sol` |
+| Creator share | 0..50% of every vault fee (`MAX_CREATOR_SHARE_BPS` = 5000), chosen by the creator in `deployToken`, does not change after registration | `VaultInfo.creatorShareBps`, `creatorShareBpsOf`, `MAX_CREATOR_SHARE_BPS`, `Vault.sol` |
+| Referral share | 25% (2500 bips) of the protocol share of a referred user's meme, set by the owner, at most 100% | `refShareBips`, `Referrals.sol` |
+| Referral code | 1..32 characters `[a-z0-9_-]` | `MAX_CODE_LENGTH`, `Referrals.sol` |
+| Reward assets per vault | up to 8 | `MAX_ASSETS`, `Vault.sol` |
+| Epoch conversion threshold | set by the owner in USDG units, 0 disables the automation | `setConversionThreshold`, `Vault.sol` |
+| Cooldown after a failed conversion | 1 minute | `CONVERSION_COOLDOWN`, `Vault.sol` |
+| Gas for conversion | 150k + 300k per asset except USDG, plus 300k for the payout (split in the vault, transfer to the protocol and referrals `notifyFee`); any swap of a meme with threshold > 0 and less gas than that reverts, only the gas actually used is paid | `CONVERSION_BASE_GAS`, `CONVERSION_GAS_PER_SWAP`, `Vault.sol`; `PAYOUT_GAS_OVERHEAD`, `HookManager.sol` |
+| Per-asset TWAP tolerance | set by the adapter owner, 1% recommended, ceiling 10% | `setRoute`, `MAX_SLIPPAGE_BPS`, `UniswapV3SwapAdapter.sol` |
+| TWAP window | 1 minute … 1 hour, 10 minutes by default in the script | `setTwapWindow`, `UniswapV3SwapAdapter.sol` |
 
-Разбивка комиссии после окна анти-снайпа при параметрах по умолчанию, в процентах от суммы сделки:
+Fee split after the anti-snipe window with default parameters, as a percentage of the trade amount:
 
-| Часть | Правило | При ставке 1% | При ставке 5% |
+| Part | Rule | At 1% rate | At 5% rate |
 |---|---|---|---|
-| Комиссия мема | `swapFeeBips`, 100..500 | 1% | 5% |
-| Протокол | 25% комиссии (`protocolShareBps` = 2500) | 0.25% | 1.25% |
-| из неё рефереру | 25% протокольной доли (`refShareBips` = 2500), только если у мема есть реферер | 0.0625% | 0.3125% |
-| Волт мема | остальные 75% комиссии | 0.75% | 3.75% |
-| из него создателю | `creatorShareBps` волта, 0..50% | 0..0.375% | 0..1.875% |
-| из него стейкерам | остальное, не меньше половины волта | 0.375..0.75% | 1.875..3.75% |
+| Meme fee | `swapFeeBips`, 100..500 | 1% | 5% |
+| Protocol | 25% of the fee (`protocolShareBps` = 2500) | 0.25% | 1.25% |
+| of which to the referrer | 25% of the protocol share (`refShareBips` = 2500), only if the meme has a referrer | 0.0625% | 0.3125% |
+| Meme vault | the remaining 75% of the fee | 0.75% | 3.75% |
+| of which to the creator | the vault's `creatorShareBps`, 0..50% | 0..0.375% | 0..1.875% |
+| of which to stakers | the rest, at least half of the vault | 0.375..0.75% | 1.875..3.75% |
 
-Подробная карта: где именно считается каждый процент (файл, функция, строка), как округляется,
-что фиксируется навсегда, а что меняется владельцем — `docs/FEES.md`.
+A detailed map: where exactly each percentage is computed (file, function, line), how it is rounded,
+what is fixed forever and what the owner can change — `docs/FEES.md`.
 
-## Развёртывание
+## Deployment
 
-Переменные окружения лежат в `env/<ENVIRONMENT>.mk`: `env/dev.mk` (девнет) и `env/prod.mk`
-(mainnet), оба не коммитятся. Окружение выбирается обязательной переменной `ENVIRONMENT=dev|prod`:
-`make <цель> ENVIRONMENT=dev`, `ENVIRONMENT=prod ./deploy.sh`. Без неё или с другим значением
-Makefile и скрипты из `tools/scripts` падают с ошибкой. Без `ENVIRONMENT` работают только `clean`,
-`compile`, `unit-tests` и `prepare-abi`: последний пишет в README ABI адреса сразу из `env/dev.mk` и
-`env/prod.mk` (колонки dev и prod, отсутствующий файл или пустое значение дают прочерк). Для prod Makefile дополнительно требует непустые
-`GEMOON_OWNER` и `GEMOON_PROXY_ADMIN_OWNER`, деплоер как владелец по умолчанию там не подставляется.
-Формат файлов: строки `KEY=VALUE` без кавычек и `$`, их читают и make, и bash. Файла `.env` быть не
-должно: forge подгружает его сам, и значения из него попали бы в любое окружение.
-Пустое значение считается незаданным.
+Environment variables live in `env/<ENVIRONMENT>.mk`: `env/dev.mk` (devnet) and `env/prod.mk`
+(mainnet), neither is committed. The environment is selected by the required variable `ENVIRONMENT=dev|prod`:
+`make <target> ENVIRONMENT=dev`, `ENVIRONMENT=prod ./deploy.sh`. Without it, or with another value, the
+Makefile and the scripts in `tools/scripts` fail with an error. Only `clean`, `compile`, `unit-tests`
+and `prepare-abi` work without `ENVIRONMENT`: the latter writes the addresses into the ABI README straight from `env/dev.mk` and
+`env/prod.mk` (dev and prod columns; a missing file or an empty value gives a dash). For prod the Makefile additionally requires non-empty
+`GEMOON_OWNER` and `GEMOON_PROXY_ADMIN_OWNER`; the deployer is not substituted as the default owner there.
+File format: `KEY=VALUE` lines without quotes or `$`, readable by both make and bash. There must be no `.env`
+file: forge loads it by itself, and its values would leak into any environment.
+An empty value counts as unset.
 
-| Переменная | Назначение |
+| Variable | Purpose |
 |---|---|
-| `RPC`, `PRIVATE_KEY` | Сеть и ключ деплоера. |
-| `POOL_MANAGER`, `POSITION_MANAGER`, `PERMIT2` | Uniswap V4 в целевой сети. |
-| `USDG_ADDRESS` | Pair-токен всех пулов. |
-| `PROTOCOL_FEE_RECIPIENT` | Только для ручных сценариев (`set-protocol-recipient RECIPIENT=…`). Полный деплой ставит получателем в волте контракт рефералов. |
-| `REFERRALS_REF_SHARE_BIPS` | Доля реферера в bips протокольной доли, по умолчанию 2500. |
-| `HOOK_TOTAL_FEE_BIPS` | Резервная комиссия хука для мемов без своей ставки (bips сделки), по умолчанию 125. |
-| `VAULT_PROTOCOL_SHARE_BPS` | Доля протокола в волте (bps комиссии), по умолчанию 2500. Потом меняется `make set-protocol-share`. |
-| `VAULT_CONVERSION_THRESHOLD` | Порог конверсии эпохи в единицах USDG, обязателен. 0 выключает автоматику. |
-| `UNISWAP_V3_FACTORY` | Фабрика Uniswap V3 с пулами USDG/актив, обязательна. |
-| `ADAPTER_TWAP_WINDOW`, `ADAPTER_MAX_SLIPPAGE_BPS` | Окно TWAP адаптера (по умолчанию 600 с) и допуск маршрутов (по умолчанию 100 bps). |
-| `DEPLOY_ASSETS_FILE` | Список наградных активов, по умолчанию `tools/scripts/robinhood-assets.csv`. |
-| `VAULT_ALLOWED_ASSETS` | Дополнительные активы без маршрута (например USDG). |
-| `VAULT_SWAP_ADAPTER`, `SWAP_ADAPTER`, `LENS_ADDRESS` | Заполняет `deploy.sh`. |
-| `GEMOON_OWNER`, `GEMOON_PROXY_ADMIN_OWNER` | Итоговый владелец контрактов и владелец ProxyAdmin. По умолчанию деплоер. |
-| `*_PROXY_ADDRESS`, `*_PROXY_ADMIN_ADDRESS` | Заполняются из логов деплоя, нужны апгрейдам и проверке. |
-| `TOKEN_DEPLOYER_ADDRESS` | Текущий TokenDeployer контроллера. Заполняет `deploy.sh`; после `make deploy-token-deployer` вписать напечатанный `TOKEN DEPLOYER`. Нужен `verify-token-deployer` и contracts-map, сам контроллер берёт деплоер из своего storage. |
+| `RPC`, `PRIVATE_KEY` | Network and deployer key. |
+| `POOL_MANAGER`, `POSITION_MANAGER`, `PERMIT2` | Uniswap V4 on the target network. |
+| `USDG_ADDRESS` | Pair token of all pools. |
+| `PROTOCOL_FEE_RECIPIENT` | Manual scenarios only (`set-protocol-recipient RECIPIENT=…`). A full deploy sets the referrals contract as the vault's recipient. |
+| `REFERRALS_REF_SHARE_BIPS` | Referrer's share in bips of the protocol share, 2500 by default. |
+| `HOOK_TOTAL_FEE_BIPS` | The hook's fallback fee for memes without their own rate (bips of the trade), 125 by default. |
+| `VAULT_PROTOCOL_SHARE_BPS` | The protocol share in the vault (bps of the fee), 2500 by default. Later changed with `make set-protocol-share`. |
+| `VAULT_CONVERSION_THRESHOLD` | Epoch conversion threshold in USDG units, required. 0 disables the automation. |
+| `UNISWAP_V3_FACTORY` | Uniswap V3 factory with USDG/asset pools, required. |
+| `ADAPTER_TWAP_WINDOW`, `ADAPTER_MAX_SLIPPAGE_BPS` | The adapter's TWAP window (600 s by default) and route tolerance (100 bps by default). |
+| `DEPLOY_ASSETS_FILE` | Reward asset list, `tools/scripts/robinhood-assets.csv` by default. |
+| `VAULT_ALLOWED_ASSETS` | Extra assets without a route (e.g. USDG). |
+| `VAULT_SWAP_ADAPTER`, `SWAP_ADAPTER`, `LENS_ADDRESS` | Filled in by `deploy.sh`. |
+| `GEMOON_OWNER`, `GEMOON_PROXY_ADMIN_OWNER` | Final owner of the contracts and owner of the ProxyAdmin. The deployer by default. |
+| `*_PROXY_ADDRESS`, `*_PROXY_ADMIN_ADDRESS` | Filled in from the deploy logs, needed by upgrades and verification. |
+| `TOKEN_DEPLOYER_ADDRESS` | The controller's current TokenDeployer. Filled in by `deploy.sh`; after `make deploy-token-deployer`, enter the printed `TOKEN DEPLOYER`. Needed by `verify-token-deployer` and contracts-map; the controller itself reads the deployer from its storage. |
 
 ```sh
-# Все цели ниже, кроме тестов и сборки, запускаются с ENVIRONMENT=dev|prod, например make verify-wiring ENVIRONMENT=dev
-ENVIRONMENT=dev ./deploy.sh [--simulate] [--no-lens]  # полный деплой: все контракты, активы и маршруты, env/dev.mk, Lens, отчёт
-make deploy-gemoon            # то же без записи адресов и Lens: Vault, Controller, Referrals, Hook, Adapter, активы, владение
-make verify-wiring            # read-only проверка, что контракты указывают друг на друга
-make upgrade-vault-proxy      # новая имплементация волта
-make upgrade-controller-proxy # новая имплементация контроллера
-make deploy-token-deployer    # новый код токенов для новых мемов: TokenDeployer + setTokenDeployer, контроллер не трогается
-make deploy-vault             # отдельный волт, если нужно заменить существующий
-make deploy-swap-adapter      # UniswapV3SwapAdapter для существующего волта
-make deploy-referrals         # GmoonReferrals за прокси (USDG_ADDRESS, CONTROLLER_PROXY_ADDRESS, HOOK_ADDRESS)
-make wire-referrals           # controller.setReferrals + referrals.setVault + vault.setProtocolRecipient(referrals) + проверка
-make upgrade-referrals-proxy  # новая имплементация рефералов
-make set-protocol-recipient [RECIPIENT=0x..] [DRY_RUN=1]  # получатель протокольной доли в волте, по умолчанию рефералы
-make set-protocol-share SHARE=2500                        # доля протокола в волте, bps комиссии
-make distribute-referrals REFERRERS="[0x..,0x..]"  # выплатить рефералам
-make withdraw-protocol-fees TO=0x..                # вывести протокольную часть
-make set-asset-allowed VAULT=0x.. FILE=tools/scripts/robinhood-assets.csv [DRY_RUN=1]  # allowlist наградных активов
-make set-route ADAPTER=0x.. FILE=tools/scripts/robinhood-assets.csv [DRY_RUN=1]        # маршруты активов на адаптере
-make create-tokens [COUNT=10] [DRY_RUN=1]  # только devnet: COUNT мемов со случайными именами, ставками и наградами
-make deploy-lens              # GemoonLens через CREATE2, повторяемо (make simulate-lens без отправки)
-make contracts-map [ARGS="--depth 2 --exclude allowedAssets"]  # read-only: граф контрактов для contracts-map
+# All targets below, except tests and build, run with ENVIRONMENT=dev|prod, e.g. make verify-wiring ENVIRONMENT=dev
+ENVIRONMENT=dev ./deploy.sh [--simulate] [--no-lens]  # full deploy: all contracts, assets and routes, env/dev.mk, Lens, report
+make deploy-gemoon            # the same without writing addresses and Lens: Vault, Controller, Referrals, Hook, Adapter, assets, ownership
+make verify-wiring            # read-only check that the contracts point at each other
+make upgrade-vault-proxy      # new vault implementation
+make upgrade-controller-proxy # new controller implementation
+make deploy-token-deployer    # new token code for new memes: TokenDeployer + setTokenDeployer, the controller is untouched
+make deploy-vault             # a standalone vault, if the existing one must be replaced
+make deploy-swap-adapter      # UniswapV3SwapAdapter for an existing vault
+make deploy-referrals         # GmoonReferrals behind a proxy (USDG_ADDRESS, CONTROLLER_PROXY_ADDRESS, HOOK_ADDRESS)
+make wire-referrals           # controller.setReferrals + referrals.setVault + vault.setProtocolRecipient(referrals) + check
+make upgrade-referrals-proxy  # new referrals implementation
+make set-protocol-recipient [RECIPIENT=0x..] [DRY_RUN=1]  # recipient of the protocol share in the vault, referrals by default
+make set-protocol-share SHARE=2500                        # protocol share in the vault, bps of the fee
+make distribute-referrals REFERRERS="[0x..,0x..]"  # pay out referrals
+make withdraw-protocol-fees TO=0x..                # withdraw the protocol part
+make set-asset-allowed VAULT=0x.. FILE=tools/scripts/robinhood-assets.csv [DRY_RUN=1]  # reward-asset allowlist
+make set-route ADAPTER=0x.. FILE=tools/scripts/robinhood-assets.csv [DRY_RUN=1]        # asset routes on the adapter
+make create-tokens [COUNT=10] [DRY_RUN=1]  # devnet only: COUNT memes with random names, rates and rewards
+make deploy-lens              # GemoonLens via CREATE2, repeatable (make simulate-lens to dry-run)
+make contracts-map [ARGS="--depth 2 --exclude allowedAssets"]  # read-only: contract graph for contracts-map
 ```
 
-### Граф контрактов для contracts-map
+`upgrade-controller-proxy` requires `GEMOON_OWNER` explicitly: `reinitialize` reassigns the controller's owner.
 
-`make contracts-map ENVIRONMENT=dev` (или `ENVIRONMENT=dev node tools/contracts-map/generate.mjs`)
-пишет `deploy-logs/contracts-map-<ENVIRONMENT>.json`: список контрактов сети и связи между ними —
-какой контракт на какой указывает и через какой метод. Только чтение (`eth_call`,
-`eth_getStorageAt`, `eth_getCode`), URL RPC в файл не попадает. ABI берутся из `out/`, поэтому сначала
-`forge build`.
+### Contract graph for contracts-map
 
-Стартовые адреса — из `env/<ENVIRONMENT>.mk`: контроллер, хук, волт, рефералы, адаптер, Lens, ProxyAdmin,
-таймлок, Uniswap, USDG, владельцы. У каждого контракта читаются слоты EIP-1967 (`implementation`,
-`admin`, `beacon`), `owner()` и все view-функции без аргументов, в результате которых есть адрес
-(включая tuple и массивы). Каждый ненулевой адрес — связь; неизвестный адрес становится узлом и
-исследуется на `--depth` шагов от стартовых (по умолчанию 1). Имплементация получает ABI своего прокси.
+`make contracts-map ENVIRONMENT=dev` (or `ENVIRONMENT=dev node tools/contracts-map/generate.mjs`)
+writes `deploy-logs/contracts-map-<ENVIRONMENT>.json`: the list of the network's contracts and the links between them —
+which contract points at which, and through which method. Read-only (`eth_call`,
+`eth_getStorageAt`, `eth_getCode`); the RPC URL does not end up in the file. ABIs are taken from `out/`, so run
+`forge build` first.
 
-| Флаг | Назначение |
+Starting addresses come from `env/<ENVIRONMENT>.mk`: controller, hook, vault, referrals, adapter, Lens, ProxyAdmin,
+timelock, Uniswap, USDG, owners. For every contract the EIP-1967 slots (`implementation`,
+`admin`, `beacon`), `owner()` and all argument-less view functions whose result contains an address are read
+(including tuples and arrays). Every non-zero address is a link; an unknown address becomes a node and
+is explored up to `--depth` steps from the starting ones (1 by default). An implementation gets the ABI of its proxy.
+
+| Flag | Purpose |
 |---|---|
-| `--out <file>` | Куда писать, по умолчанию `deploy-logs/contracts-map-<ENVIRONMENT>.json`. |
-| `--rpc <url>` | Другой RPC вместо `RPC` из env-файла. |
-| `--depth <n>` | Сколько шагов от стартовых адресов добавлять новые узлы. |
-| `--exclude <regex>` | Не читать геттеры с подходящим именем, например `allowedAssets` (65 наградных активов). |
-| `--no-abi` | Без ABI в файле (файл в разы меньше, но в карточке не будет методов). |
-| `--no-eoa` | Без адресов без кода (владельцы-EOA). |
+| `--out <file>` | Where to write, `deploy-logs/contracts-map-<ENVIRONMENT>.json` by default. |
+| `--rpc <url>` | A different RPC instead of `RPC` from the env file. |
+| `--depth <n>` | How many steps from the starting addresses new nodes are added. |
+| `--exclude <regex>` | Skip getters with a matching name, e.g. `allowedAssets` (65 reward assets). |
+| `--no-abi` | No ABI in the file (the file is several times smaller, but the card will have no methods). |
+| `--no-eoa` | No addresses without code (EOA owners). |
 
-Формат (`format: "contracts-map/links@1"`):
+Format (`format: "contracts-map/links@1"`):
 
 ```json
 {
@@ -441,145 +443,145 @@ make contracts-map [ARGS="--depth 2 --exclude allowedAssets"]  # read-only: гр
 }
 ```
 
-`kind` контракта: `proxy`, `implementation`, `contract`, `eoa`. `path` — место адреса внутри
-результата (`protocol.hook`, `[3]`). В contracts-map файл импортируется кнопкой «Импорт» (файл),
-«Импорт URL» или ссылкой `?import=<url>`, и сливается с текущей картой.
+Contract `kind`: `proxy`, `implementation`, `contract`, `eoa`. `path` is the location of the address inside
+the result (`protocol.hook`, `[3]`). The file is imported into contracts-map with the "Import" button (file),
+"Import URL" or the `?import=<url>` link, and is merged into the current map.
 
-Подключение рефералов к существующему деплою: `deploy-referrals` → адрес прокси в
-`REFERRALS_PROXY_ADDRESS` → `wire-referrals` от владельца контроллера, волта и рефералов. С этого
-момента волт отдаёт протокольную долю рефералам вместо прежнего `PROTOCOL_FEE_RECIPIENT`;
-накопленное в хуке до переключения тоже уйдёт туда при следующей выплате. Контроллер нужно предварительно обновить
+Connecting referrals to an existing deployment: `deploy-referrals` → proxy address into
+`REFERRALS_PROXY_ADDRESS` → `wire-referrals` from the owner of the controller, vault and referrals. From that
+moment the vault sends the protocol share to referrals instead of the previous `PROTOCOL_FEE_RECIPIENT`;
+what the hook accumulated before the switch will go there too on the next payout. The controller must be upgraded first
 (`upgrade-controller-proxy`, `GEMOON_VERSION` = 2).
 
-**Переход с хука, который сам делил комиссию.** Хуки старой схемы (с `PROTOCOL_SHARE_BIPS` и
-`protocolRecipient`) отдают волту только его часть, а новый волт снимает долю протокола с каждого
-`notifyFees`. Если обновить волт под живыми пулами старого хука и включить `protocolShareBps` > 0,
-мемы старого хука заплатят протоколу дважды. Порядок: обновить волт (доля после апгрейда = 0,
-получатель не задан, поведение прежнее) → задеплоить новый хук и переключить на него
-`controller.setHook` / `vault.setHook` → только если старых пулов с объёмом нет, включить долю
-`make set-protocol-share`. Иначе доля протокола остаётся 0, пока старые пулы торгуются.
+**Migrating from a hook that split the fee itself.** Old-scheme hooks (with `PROTOCOL_SHARE_BIPS` and
+`protocolRecipient`) hand the vault only its part, while the new vault takes the protocol share from every
+`notifyFees`. If you upgrade the vault under live pools of an old hook and enable `protocolShareBps` > 0,
+the old hook's memes will pay the protocol twice. Order: upgrade the vault (the share after the upgrade is 0,
+no recipient set, behaviour unchanged) → deploy the new hook and switch to it with
+`controller.setHook` / `vault.setHook` → only if no old pools with volume remain, enable the share with
+`make set-protocol-share`. Otherwise the protocol share stays 0 while the old pools trade.
 
-После деплоя `GEMOON_OWNER`, если он не деплоер, зовёт `acceptOwnership` у Vault, GmoonReferrals
-и UniswapV3SwapAdapter. Контроллер принадлежит ему сразу, у хука и TokenDeployer владельца нет. Отчёт деплоя
-(`deploy-logs/deploy-<время>-report.md`) перечисляет адреса, назначение контрактов, связку,
-владельцев, результат по каждому активу и оставшиеся шаги. Подробно — `docs/DEPLOY.md`.
+After deployment `GEMOON_OWNER`, if it is not the deployer, calls `acceptOwnership` on Vault, GmoonReferrals
+and UniswapV3SwapAdapter. The controller belongs to it at once; the hook and TokenDeployer have no owner. The deploy report
+(`deploy-logs/deploy-<time>-report.md`) lists the addresses, the purpose of the contracts, the wiring,
+owners, the result for each asset and the remaining steps. Details — `docs/DEPLOY.md`.
 
-Токен проекта (`ProjectToken`) деплоится отдельно, без контроллера:
+The project token (`ProjectToken`) is deployed separately, without the controller:
 `forge script script/DeployProjectToken.s.sol:DeployProjectToken --rpc-url $RPC --private-key $PRIVATE_KEY --broadcast`
-с переменными `PROJECT_TOKEN_NAME`, `PROJECT_TOKEN_SYMBOL`, `PROJECT_TOKEN_URI` (необязательно), `PROJECT_POOL_FEE`
-(по умолчанию 10000 = 1%), `PROJECT_TOKENS_PER_PAIR` (по умолчанию 50 000 токенов за 1 USDG, капа $20k), плюс
-`USDG_ADDRESS`, `POOL_MANAGER`, `POSITION_MANAGER`, `PERMIT2` из env-файла.
+with the variables `PROJECT_TOKEN_NAME`, `PROJECT_TOKEN_SYMBOL`, `PROJECT_TOKEN_URI` (optional), `PROJECT_POOL_FEE`
+(10000 = 1% by default), `PROJECT_TOKENS_PER_PAIR` (50 000 tokens per 1 USDG by default, a $20k cap), plus
+`USDG_ADDRESS`, `POOL_MANAGER`, `POSITION_MANAGER`, `PERMIT2` from the env file.
 
-Хук деплоится через CREATE2 без прокси: адрес контракта должен нести биты разрешений.
-Скрипт сам подбирает соль и проверяет результат. В сети должен существовать детерминированный
-CREATE2-деплоер `0x4e59b44847b379578588920cA78FbF26c0B4956C`.
+The hook is deployed via CREATE2 without a proxy: the contract address must carry the permission bits.
+The script mines the salt itself and verifies the result. The network must have the deterministic
+CREATE2 deployer `0x4e59b44847b379578588920cA78FbF26c0B4956C`.
 
-**Новый код токенов без передеплоя контроллера.** Правка `Token.sol` (или новый контракт токена в
+**New token code without redeploying the controller.** Edit `Token.sol` (or a new token contract in
 `TokenDeployer`) → `make simulate-token-deployer ENVIRONMENT=…` → `make deploy-token-deployer ENVIRONMENT=…`
-от владельца контроллера → напечатанный `TOKEN DEPLOYER` в `TOKEN_DEPLOYER_ADDRESS` → `make verify-wiring`
-и `make -f verify.mk verify-token-deployer`. Мемы, созданные после `setTokenDeployer`, получают новый код,
-прежние остаются со своим. Если контроллер принадлежит таймлоку, скрипт только деплоит TokenDeployer и
-печатает calldata `setTokenDeployer` для Safe. Подробно — `docs/DEPLOY.md`, раздел 4.
+from the controller owner → the printed `TOKEN DEPLOYER` into `TOKEN_DEPLOYER_ADDRESS` → `make verify-wiring`
+and `make -f verify.mk verify-token-deployer`. Memes created after `setTokenDeployer` get the new code,
+earlier ones keep their own. If the controller is owned by a timelock, the script only deploys the TokenDeployer and
+prints the `setTokenDeployer` calldata for the Safe. Details — `docs/DEPLOY.md`, section 4.
 
-## Тесты
+## Tests
 
 ```sh
-make unit-tests     # всё, кроме test/fork
-make devnet-tests ENVIRONMENT=dev  # форк девнета, нужен DEVNET_RPC в env/dev.mk
-forge test          # всё вместе; форк-тесты запустятся, только если DEVNET_RPC есть в окружении
+make unit-tests     # everything except test/fork
+make devnet-tests ENVIRONMENT=dev  # devnet fork, needs DEVNET_RPC in env/dev.mk
+forge test          # all together; fork tests run only if DEVNET_RPC is in the environment
 ```
 
-- `test/VaultTest.sol`, `test/VaultUpgradeTest.sol`: волт, включая автоконверсию по порогу,
-  кулдаун, инварианты и апгрейд.
-- `test/VaultPrecisionTest.sol`: округление доли маленького стейка рядом с китами (800 млн /
-  100 млн / 1 мем) на параметрах продакшена, fuzz на границы потерь от округления.
-- `test/UniswapV3SwapAdapterTest.sol`: адаптер против мок-пула с настраиваемыми TWAP и спотом,
-  fuzz на границу допуска, интеграция с настоящим волтом.
-- `test/DeployGemoonTest.sol`: логика скрипта деплоя, связка, владение, биты адреса хука,
-  доступ `onlyController` к хуку, TokenDeployer в связке и замена деплоера скриптом
-  `DeployTokenDeployer` (от владельца контроллера и от постороннего).
-- `test/TokenDeployerTest.sol`: TokenDeployer сам по себе — вызывать может только свой контроллер
-  (fuzz по вызывающему), вся эмиссия уходит вызывающему, токен несёт переданные метаданные,
-  создателя и `feeInfo` (fuzz).
-- `test/DeployGemoonFullTest.sol`: полный деплой со всеми пятью контрактами, разбор файла
-  активов, allowlist и маршруты с пропуском неконвертируемых активов (fuzz на инвариант
-  «разрешён ⇔ есть маршрут»), владение, отчёт, `run()` из окружения.
-- `test/ControllerDeployTokenTest.sol`: end-to-end в процессе теста. Настоящие PoolManager,
-  PositionManager и Permit2 из `lib/`, деплой через скрипт, `deployToken`, свопы, путь комиссии
-  до протокола и волта, fuzz на инвариант «протокол + волт + начислено = вся взятая комиссия»,
-  свопы в окне повышенной комиссии, dev buy: лимит, слиппедж, базовая ставка, fuzz на точный
-  выход, сохранение комиссии и монотонность стоимости. TokenDeployer: `setTokenDeployer` (доступ,
-  чужой контроллер), смена кода токенов новых мемов без апгрейда контроллера, fuzz на инвариант
-  «вся эмиссия в позиции или revert `TokenSupplyMismatch`» при любом коде токена. `changeAdmin`:
-  только админ мема, fuzz на инвариант «не-админ не меняет список админов».
-- `test/HookFeeMath.sol`: кривая комиссии хука, границы окна, fuzz на диапазон и монотонность.
-- `test/fork/ControllerDevnetForkTest.sol`: то же против девнета, anvil-форк Robinhood Chain с
-  его Uniswap V4, chain id 1488 (адреса из `env/dev.mk`). Ничего не бродкастит, форк живёт внутри прогона. `DEVNET_BLOCK`
-  фиксирует блок, `OPERATOR_ADDRESS` задаёт профинансированный аккаунт девнета. Подробности в
-  `docs/DEPLOY.md`, раздел «Девнет».
-- `test/fork/DevBuyDevnetForkTest.sol`: сквозной dev buy на девнете. Создатель деплоит мем с
-  покупкой 3% эмиссии; проверяется, что у него ровно 3%, комиссия по базовой ставке доходит до
-  протокола и волта (сразу через `distribute` или следующим свопом), волт закрывает несколько
-  эпох, создатель забирает награды как стейкер и как создатель. Наградный актив здесь сам USDG,
-  потому что на форке нет пулов V3 для mock USDG. Окружение то же, что у форк-теста выше.
+- `test/VaultTest.sol`, `test/VaultUpgradeTest.sol`: the vault, including threshold auto-conversion,
+  cooldown, invariants and upgrade.
+- `test/VaultPrecisionTest.sol`: rounding of a small stake's share next to whales (800M /
+  100M / 1 meme) with production parameters, fuzz on the rounding-loss boundaries.
+- `test/UniswapV3SwapAdapterTest.sol`: the adapter against a mock pool with configurable TWAP and spot,
+  fuzz on the tolerance boundary, integration with the real vault.
+- `test/DeployGemoonTest.sol`: deploy script logic, wiring, ownership, hook address bits,
+  `onlyController` access to the hook, TokenDeployer in the wiring and replacing the deployer with the
+  `DeployTokenDeployer` script (from the controller owner and from an outsider).
+- `test/TokenDeployerTest.sol`: TokenDeployer on its own — only its own controller can call it
+  (fuzz over the caller), the whole supply goes to the caller, the token carries the passed metadata,
+  creator and `feeInfo` (fuzz).
+- `test/DeployGemoonFullTest.sol`: a full deploy with all five contracts, asset file parsing,
+  allowlist and routes skipping non-convertible assets (fuzz on the invariant
+  "allowed ⇔ has a route"), ownership, report, `run()` from the environment.
+- `test/ControllerDeployTokenTest.sol`: in-process end-to-end. The real PoolManager,
+  PositionManager and Permit2 from `lib/`, deploy through the script, `deployToken`, swaps, the fee path
+  to the protocol and vault, fuzz on the invariant "protocol + vault + accrued = the whole fee taken",
+  swaps in the raised-fee window, dev buy: limit, slippage, base rate, fuzz on exact
+  output, fee conservation and cost monotonicity. TokenDeployer: `setTokenDeployer` (access,
+  foreign controller), changing the token code of new memes without a controller upgrade, fuzz on the invariant
+  "the whole supply is in the position or `TokenSupplyMismatch` reverts" for any token code. `changeAdmin`:
+  only a meme admin, fuzz on the invariant "a non-admin does not change the admin list".
+- `test/HookFeeMath.sol`: the hook's fee curve, window boundaries, fuzz on range and monotonicity.
+- `test/fork/ControllerDevnetForkTest.sol`: the same against devnet, an anvil fork of Robinhood Chain with
+  its Uniswap V4, chain id 1488 (addresses from `env/dev.mk`). Broadcasts nothing, the fork lives inside the run. `DEVNET_BLOCK`
+  pins the block, `OPERATOR_ADDRESS` sets a funded devnet account. Details in
+  `docs/DEPLOY.md`, section "Devnet".
+- `test/fork/DevBuyDevnetForkTest.sol`: end-to-end dev buy on devnet. The creator deploys a meme with a
+  3%-of-supply buy; it checks that they hold exactly 3%, the fee at the base rate reaches the
+  protocol and vault (immediately via `distribute` or with the next swap), the vault closes several
+  epochs, the creator claims rewards as a staker and as a creator. The reward asset here is USDG itself,
+  because the fork has no V3 pools for mock USDG. Same environment as the fork test above.
 
-Форк-тест проверяет логику контрактов один в один с сетью, но не проверяет инфраструктуру
-транзакций: лимит размера контракта, газ-лимит блока, реальный CREATE2-деплоер и путь
-`run()` скрипта. Для этого нужен живой прогон скриптом с broadcast.
+A fork test checks contract logic one to one with the network, but does not check transaction
+infrastructure: the contract size limit, the block gas limit, the real CREATE2 deployer and the script's
+`run()` path. That needs a live run of the script with broadcast.
 
-## Документация
+## Documentation
 
-- `docs/FEES.md`: полная карта комиссий — какой процент куда уходит, в каком контракте и в какой
-  функции считается, как округляется, что и кем может быть изменено.
-- `docs/DEPLOY.md`: деплой, апгрейды, swap adapter, девнет.
-- `docs/upgrades.md`: правила обновления прокси.
-- `indexing.md`: какие события и view-функции дают метрики Main Page и Staking Page,
-  формулы цены, объёма, наград и доходности для индексатора.
-- `README-ABI.md`: генерация ABI.
-- `TEST-CASES.md`: все тест-кейсы таблицами: что проверяет каждый тест, какие инварианты
-  покрывает и какой результат ожидается. Обновляется вместе с тестами.
+- `docs/FEES.md`: the full fee map — what percentage goes where, in which contract and in which
+  function it is computed, how it is rounded, what can be changed and by whom.
+- `docs/DEPLOY.md`: deployment, upgrades, swap adapter, devnet.
+- `docs/upgrades.md`: proxy upgrade rules.
+- `indexing.md`: which events and view functions provide the Main Page and Staking Page metrics,
+  the price, volume, reward and yield formulas for the indexer.
+- `README-ABI.md`: ABI generation.
+- `TEST-CASES.md`: all test cases as tables: what each test checks, which invariants it
+  covers and the expected result. Updated together with the tests.
 
-## Известные особенности и tech debt
+## Known issues and tech debt
 
-- **Первый своп не выплачивает комиссию.** Роутер переводит USDG свопера уже после `afterSwap`,
-  а все пулы односторонние, USDG в PoolManager появляется только от покупок. Комиссия остаётся
-  начисленной до следующего свопа или `distribute`.
-- **Ликвидность заперта.** NFT позиции лежит на контроллере, функции управлять ей у контроллера
-  нет. Забрать ликвидность можно только апгрейдом.
-- **`ProxyGemoonControllerUpgrade` зовёт `reinitialize`** под `reinitializer(GEMOON_VERSION)`, а
-  версия равна 1, которую уже занял `initialize`. Апгрейд с вызовом упадёт, пока версия не
-  поднята. Апгрейд волта пропускает вызов, если версия не изменилась.
-- **Контроллер, обновлённый с версии без TokenDeployer** (до вынесения деплоера в отдельный
-  контракт токен создавала внешняя библиотека `Deployer` прямо из контроллера), после апгрейда не
-  имеет `tokenDeployer`: `deployToken` падает с `TokenDeployerNotSet`, пока владелец не выполнит
-  `make deploy-token-deployer`. `make verify-wiring` до этого тоже падает. Мемы старой версии —
-  CREATE самого контроллера, новые — CREATE TokenDeployer: искать мемы по nonce контроллера больше
-  нельзя, источник — событие `TokenCreated`.
-- **`ProxyGemoonControllerUpgrade` берёт pair-токен из `USDG_ADDRESS`** и до отправки сверяет его
-  с `pairToken()` текущего хука: `reinitialize` перезаписывает pair-токен контроллера.
-- **HookManager больше не за прокси (версия 2):** `initialize`/`reinitialize`, `ProxyHookUpgrade`,
-  `make upgrade-hook-proxy` и `HOOK_PROXY_ADMIN_ADDRESS` удалены, `HOOK_PROXY_ADDRESS` переименован в
-  `HOOK_ADDRESS`. Хуки, развёрнутые раньше, остаются прокси: их пулы привязаны к адресу прокси.
-  Чтобы и они стали неизменяемыми, владелец ProxyAdmin старого хука может отказаться от владения
-  (`renounceOwnership`) — это необратимо.
-- **HookManager без владельца (версия 3):** `Ownable2Step`, `setVault`, `setController`, события
-  `VaultUpdated`/`ControllerUpdated` удалены; конструктор `(poolManager, pairToken, vault,
-  controller, feeBips)` без `owner`. Повод — сканеры помечали «владелец может стать контроллером
-  и запустить 80%-окно» и «владелец может перенаправить комиссии». `TransferToGovernance` хук
-  больше не трогает. Хуки версии 2 (с владельцем) остаются как есть, их пулы к ним привязаны.
-- **`deployToken` изменил ABI в 2.0:** параметр имени стратегии убран, в `DeployConfig` добавлено
-  поле `devBuy`, интеграции нужно обновить.
-- **Контроллер освобождён от анти-снайп комиссии** по `sender == controller` в хуке. Это
-  безопасно, пока контроллер свопает только в dev buy; любая новая функция контроллера со свопом
-  тоже получит базовую ставку.
-- **`Vault.allowedAssets()` добавлен апгрейдом storage** (`s_allowedAssetList` в конце layout).
-  У прокси волта, развёрнутого раньше, список после апгрейда пуст, хотя `isAssetAllowed` верен.
-  Владелец заполняет его повторным `setAssetAllowed(asset, true)` по каждому уже разрешённому
-  активу, вызов идемпотентный.
-- **Мёртвый слот `_deployStrategies`** в контроллере сохранён ради storage layout прокси.
-- **Админы из `tokenConfig.admins` не попадают в мем.** `deployToken` резервирует под них места,
-  но не заполняет их: у мема только два неудаляемых админа, контроллер и вызывающий (README-ABI и
-  NatSpec `deployToken` описывают иначе), поэтому заменять через `changeAdmin` пока некого.
-  Контроллеры до проверки `NotTokenAdmin` пропускали `changeAdmin` от кого угодно: мем видит
-  вызывающим контроллер, а тот его админ. Чинить копирование админов можно только вместе с
-  апгрейдом контроллера на версию с этой проверкой.
+- **The first swap does not pay out the fee.** The router transfers the swapper's USDG after `afterSwap`,
+  and all pools are single-sided, so USDG appears in the PoolManager only from buys. The fee stays
+  accrued until the next swap or `distribute`.
+- **Liquidity is locked.** The position NFT sits on the controller, and the controller has no function to manage it.
+  Liquidity can only be recovered through an upgrade.
+- **`ProxyGemoonControllerUpgrade` calls `reinitialize`** under `reinitializer(GEMOON_VERSION)`, and the
+  version equals 1, which `initialize` already took. An upgrade with the call fails until the version is
+  raised. The vault upgrade skips the call if the version has not changed.
+- **A controller upgraded from a version without TokenDeployer** (before the deployer was extracted into a separate
+  contract, an external `Deployer` library created tokens straight from the controller) has no
+  `tokenDeployer` after the upgrade: `deployToken` fails with `TokenDeployerNotSet` until the owner runs
+  `make deploy-token-deployer`. `make verify-wiring` also fails until then. Memes of the old version are
+  created by the controller itself (CREATE), new ones by TokenDeployer: memes can no longer be found
+  by the controller's nonce, the source is the `TokenCreated` event.
+- **`ProxyGemoonControllerUpgrade` takes the pair token from `USDG_ADDRESS`** and, before sending, checks it
+  against the current hook's `pairToken()`: `reinitialize` overwrites the controller's pair token.
+- **HookManager is no longer behind a proxy (version 2):** `initialize`/`reinitialize`, `ProxyHookUpgrade`,
+  `make upgrade-hook-proxy` and `HOOK_PROXY_ADMIN_ADDRESS` were removed, `HOOK_PROXY_ADDRESS` was renamed to
+  `HOOK_ADDRESS`. Hooks deployed earlier remain proxies: their pools are bound to the proxy address.
+  To make them immutable too, the owner of the old hook's ProxyAdmin can renounce ownership
+  (`renounceOwnership`) — this is irreversible.
+- **HookManager without an owner (version 3):** `Ownable2Step`, `setVault`, `setController` and the
+  `VaultUpdated`/`ControllerUpdated` events were removed; the constructor is `(poolManager, pairToken, vault,
+  controller, feeBips)` without `owner`. The reason: scanners flagged "the owner can become the controller
+  and start the 80% window" and "the owner can redirect fees". `TransferToGovernance` no longer
+  touches the hook. Version 2 hooks (with an owner) stay as they are, their pools are bound to them.
+- **`deployToken` changed its ABI in 2.0:** the strategy-name parameter was removed and the `devBuy` field was
+  added to `DeployConfig`; integrations must be updated.
+- **The controller is exempt from the anti-snipe fee** by `sender == controller` in the hook. This is
+  safe as long as the controller swaps only in dev buy; any new controller function with a swap
+  will also get the base rate.
+- **`Vault.allowedAssets()` was added by a storage upgrade** (`s_allowedAssetList` at the end of the layout).
+  For a vault proxy deployed earlier the list is empty after the upgrade, although `isAssetAllowed` is correct.
+  The owner fills it by calling `setAssetAllowed(asset, true)` again for each already allowed
+  asset; the call is idempotent.
+- **The dead slot `_deployStrategies`** in the controller is kept for the proxy's storage layout.
+- **Admins from `tokenConfig.admins` do not reach the meme.** `deployToken` reserves slots for them
+  but does not fill them: a meme has only two non-removable admins, the controller and the caller (README-ABI and the
+  `deployToken` NatSpec say otherwise), so there is nobody to replace via `changeAdmin` yet.
+  Controllers before the `NotTokenAdmin` check let `changeAdmin` through from anyone: the meme sees the
+  controller as the caller, and the controller is its admin. Fixing the admin copy is possible only together with
+  a controller upgrade to a version with this check.
